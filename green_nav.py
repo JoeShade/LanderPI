@@ -182,7 +182,7 @@ class GreenLineFollowingNode(Node):
             twist = Twist()
             if self.follower is None:
                 self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-            twist.linear.x = 0.05
+            twist.linear.x = 0.15 # Speed variable
             result_image, deflection_angle = self.follower(
                 rgb_image,
                 result_image,
