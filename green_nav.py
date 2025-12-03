@@ -50,6 +50,8 @@ class GreenLineFollowingNode(Node):
         self.image_height = None
         self.image_width = None
         self.bridge = CvBridge()
+        self.window_name = "green_nav"
+        self.window_initialized = False
         self.use_color_picker = False  # lock to green
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
@@ -215,12 +217,27 @@ class GreenLineFollowingNode(Node):
                 self.mecanum_pub.publish(Twist())
             else:
                 self.pid.clear()
+        # Show live camera view in an OpenCV window
+        try:
+            if not self.window_initialized:
+                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                self.window_initialized = True
+            cv2.imshow(self.window_name, cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR))
+            cv2.waitKey(1)
+        except Exception as e:
+            self.get_logger().error(f"OpenCV display error: {e}")
+
         self.result_publisher.publish(self.bridge.cv2_to_imgmsg(result_image, "rgb8"))
 
 
 def main():
     node = GreenLineFollowingNode('green_nav')
     rclpy.spin(node)
+    try:
+        if node.window_initialized:
+            cv2.destroyWindow(node.window_name)
+    except Exception:
+        pass
     node.destroy_node()
     rclpy.shutdown()
 
