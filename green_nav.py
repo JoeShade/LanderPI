@@ -256,7 +256,7 @@ class GreenLineFollowingNode(Node):
         left_nonan = np.isfinite(left_range[left_nonzero])
         right_nonan = np.isfinite(right_range[right_nonzero])
         min_dist_left_ = left_range[left_nonzero][left_nonan]
-            min_dist_right_ = right_range[right_nonzero][right_nonan]
+        min_dist_right_ = right_range[right_nonzero][right_nonan]
         if len(min_dist_left_) > 1 and len(min_dist_right_) > 1:
             min_dist_left = min_dist_left_.min()
             min_dist_right = min_dist_right_.min()
