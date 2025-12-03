@@ -135,6 +135,7 @@ class GreenLineFollowingNode(Node):
         self.use_color_picker = False  # lock to green
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.lab_lookup_type = self.camera_type if self.camera_type in self.lab_data.get('lab', {}) else 'ascamera'
         self.last_image_ts = None
         default_image_topic = self._resolve_image_topic()
         # Handle auto-declared params (automatically_declare_parameters_from_overrides=True) without double-declare crashes.
@@ -161,7 +162,7 @@ class GreenLineFollowingNode(Node):
 
         Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))
         self.debug = bool(self.get_parameter('debug').value)
-        self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
+        self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, using LAB key={self.lab_lookup_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
         self.get_logger().info('\033[1;32m%s\033[0m' % 'green_nav start')
 
     def log_debug(self, message: str):
@@ -315,11 +316,17 @@ class GreenLineFollowingNode(Node):
             if self.follower is None:
                 self.follower = LineFollower([None, common.range_rgb[self.color]], self)
             twist.linear.x = 0.15 # Speed variable
+            try:
+                lab_config = self.lab_data['lab'][self.lab_lookup_type][self.color]
+            except Exception:
+                lab_config = self.lab_data['lab'][list(self.lab_data.get('lab', {}).keys())[0]][self.color]
+                self.log_debug(f"Falling back to LAB config key: {self.lab_lookup_type}")
+
             result_image, deflection_angle = self.follower(
                 rgb_image,
                 result_image,
                 self.threshold,
-                self.lab_data['lab'][self.camera_type][self.color],
+                lab_config,
                 False,
             )
             if deflection_angle is not None:
