@@ -40,6 +40,8 @@ class GreenLineFollowingNode(Node):
         self.empty = 0
         self.count = 0
         self.stop = False
+        self.searching_for_green = True
+        self.search_angular_speed = 0.4
         self.threshold = 0.5
         self.stop_threshold = 0.4
         self.lock = threading.RLock()
@@ -85,6 +87,7 @@ class GreenLineFollowingNode(Node):
         with self.lock:
             self.stop = False
             self.is_running = False
+            self.searching_for_green = True
             self.pid = pid.PID(1.1, 0.0, 0.0)
             self.follower = LineFollower([None, common.range_rgb[self.color]], self)
             self.threshold = 0.5
@@ -126,6 +129,8 @@ class GreenLineFollowingNode(Node):
         with self.lock:
             self.is_running = request.data
             self.empty = 0
+            if self.is_running:
+                self.searching_for_green = True
             if not self.is_running:
                 self.mecanum_pub.publish(Twist())
         response.success = True
@@ -190,6 +195,8 @@ class GreenLineFollowingNode(Node):
                 self.lab_data['lab'][self.camera_type][self.color],
                 False,
             )
+            if deflection_angle is not None:
+                self.searching_for_green = False
             if deflection_angle is not None and self.is_running and not self.stop:
                 self.pid.update(deflection_angle)
                 if 'Acker' in self.machine_type:
@@ -199,6 +206,10 @@ class GreenLineFollowingNode(Node):
                         twist.angular.z = twist.linear.x / R
                 else:
                     twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
+                self.mecanum_pub.publish(twist)
+            elif self.is_running and self.searching_for_green and not self.stop:
+                twist.linear.x = 0.0
+                twist.angular.z = self.search_angular_speed
                 self.mecanum_pub.publish(twist)
             elif self.stop:
                 self.mecanum_pub.publish(Twist())
