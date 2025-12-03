@@ -20,7 +20,83 @@ from servo_controller_msgs.msg import ServosPosition
 from servo_controller.bus_servo_control import set_servo_position
 from cv_bridge import CvBridge
 from app.common import Heart
-from green_nav_pkg.line_following import LineFollower, MAX_SCAN_ANGLE
+
+
+MAX_SCAN_ANGLE = 240  # degree (lidar scanning angle used for obstacle checks)
+
+
+class LineFollower:
+    """Minimal in-package copy of the line follower used by green_nav."""
+
+    def __init__(self, color, node):
+        self.node = node
+        self.target_lab, self.target_rgb = color
+        self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        if self.depth_camera_type == 'ascamera':
+            self.rois = ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1))
+        elif self.depth_camera_type == 'aurora':  # Aurora camera defaults
+            self.rois = ((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1))
+        elif self.depth_camera_type == 'usb_cam':
+            self.rois = ((0.79, 0.81, 0, 1, 0.7), (0.67, 0.69, 0, 1, 0.2), (0.55, 0.57, 0, 1, 0.1))
+        else:
+            self.rois = ((0.8, 0.85, 0, 1, 0.7), (0.7, 0.75, 0, 1, 0.2), (0.6, 0.65, 0, 1, 0.1))
+
+        self.weight_sum = 1.0
+
+    @staticmethod
+    def get_area_max_contour(contours, threshold=100):
+        contour_area = zip(contours, tuple(map(lambda c: math.fabs(cv2.contourArea(c)), contours)))
+        contour_area = tuple(filter(lambda c_a: c_a[1] > threshold, contour_area))
+        if len(contour_area) > 0:
+            max_c_a = max(contour_area, key=lambda c_a: c_a[1])
+            return max_c_a
+        return None
+
+    def __call__(self, image, result_image, threshold, color=None, use_color_picker=True):
+        centroid_sum = 0
+        h, w = image.shape[:2]
+        if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
+            w = w + 200
+        if use_color_picker:
+            min_color = [int(self.target_lab[0] - 50 * threshold * 2),
+                         int(self.target_lab[1] - 50 * threshold),
+                         int(self.target_lab[2] - 50 * threshold)]
+            max_color = [int(self.target_lab[0] + 50 * threshold * 2),
+                         int(self.target_lab[1] + 50 * threshold),
+                         int(self.target_lab[2] + 50 * threshold)]
+            target_color = self.target_lab, min_color, max_color
+            lowerb = tuple(target_color[1])
+            upperb = tuple(target_color[2])
+        else:
+            lowerb = tuple(color['min'])
+            upperb = tuple(color['max'])
+        for roi in self.rois:
+            blob = image[int(roi[0]*h):int(roi[1]*h), int(roi[2]*w):int(roi[3]*w)]
+            img_lab = cv2.cvtColor(blob, cv2.COLOR_RGB2LAB)
+            img_blur = cv2.GaussianBlur(img_lab, (3, 3), 3)
+            mask = cv2.inRange(img_blur, lowerb, upperb)
+            eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+            dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+            contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
+            max_contour_area = self.get_area_max_contour(contours, 30)
+            if max_contour_area is not None:
+                rect = cv2.minAreaRect(max_contour_area[0])
+                box = np.intp(cv2.boxPoints(rect))
+                for j in range(4):
+                    box[j, 1] = box[j, 1] + int(roi[0]*h)
+                cv2.drawContours(result_image, [box], -1, (0, 255, 255), 2)
+
+                pt1_x, pt1_y = box[0, 0], box[0, 1]
+                pt3_x, pt3_y = box[2, 0], box[2, 1]
+                line_center_x, line_center_y = (pt1_x + pt3_x) / 2, (pt1_y + pt3_y) / 2
+
+                cv2.circle(result_image, (int(line_center_x), int(line_center_y)), 5, (0, 0, 255), -1)
+                centroid_sum += line_center_x * roi[-1]
+        if centroid_sum == 0:
+            return result_image, None
+        center_pos = centroid_sum / self.weight_sum
+        deflection_angle = -math.atan((center_pos - (w / 2.0)) / (h / 2.0))
+        return result_image, deflection_angle
 
 
 class GreenLineFollowingNode(Node):
