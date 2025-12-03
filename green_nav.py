@@ -135,7 +135,8 @@ class GreenLineFollowingNode(Node):
         self.use_color_picker = False  # lock to green
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
-        self.lab_lookup_type = self.camera_type if self.camera_type in self.lab_data.get('lab', {}) else 'ascamera'
+        lab_map = self.lab_data.get('lab', {})
+        self.lab_lookup_type = self.camera_type if self.camera_type in lab_map else 'ascamera'
         self.last_image_ts = None
         default_image_topic = self._resolve_image_topic()
         # Handle auto-declared params (automatically_declare_parameters_from_overrides=True) without double-declare crashes.
@@ -316,11 +317,19 @@ class GreenLineFollowingNode(Node):
             if self.follower is None:
                 self.follower = LineFollower([None, common.range_rgb[self.color]], self)
             twist.linear.x = 0.15 # Speed variable
-            try:
-                lab_config = self.lab_data['lab'][self.lab_lookup_type][self.color]
-            except Exception:
-                lab_config = self.lab_data['lab'][list(self.lab_data.get('lab', {}).keys())[0]][self.color]
-                self.log_debug(f"Falling back to LAB config key: {self.lab_lookup_type}")
+            lab_map = self.lab_data.get('lab', {})
+            # Robust LAB selection with fallback to first available entry
+            lab_config = lab_map.get(self.lab_lookup_type, {}).get(self.color)
+            if lab_config is None and 'ascamera' in lab_map:
+                lab_config = lab_map['ascamera'].get(self.color)
+                self.log_debug(f"Falling back to LAB config key: ascamera")
+            if lab_config is None and lab_map:
+                first_key = next(iter(lab_map))
+                lab_config = lab_map[first_key].get(self.color)
+                self.log_debug(f"Falling back to LAB config key: {first_key}")
+            if lab_config is None:
+                self.get_logger().error("LAB config missing for selected color; cannot proceed.")
+                return
 
             result_image, deflection_angle = self.follower(
                 rgb_image,
