@@ -11,6 +11,7 @@ import rclpy
 import sdk.pid as pid
 import sdk.common as common
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from std_srvs.srv import SetBool, Trigger
 from sensor_msgs.msg import Image, LaserScan
@@ -136,7 +137,16 @@ class GreenLineFollowingNode(Node):
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
         self.last_image_ts = None
         default_image_topic = self._resolve_image_topic()
-        self.image_topic = self.declare_parameter('image_topic', default_image_topic).value
+        # Handle auto-declared params (automatically_declare_parameters_from_overrides=True) without double-declare crashes.
+        image_topic_param = self.get_parameter('image_topic')
+        if image_topic_param.type_ == Parameter.Type.NOT_SET or image_topic_param.value is None:
+            try:
+                self.declare_parameter('image_topic', default_image_topic)
+            except Exception:
+                pass
+            self.image_topic = default_image_topic
+        else:
+            self.image_topic = image_topic_param.value
         self.lidar_type = os.environ.get('LIDAR_TYPE')
         self.machine_type = os.environ.get('MACHINE_TYPE')
         self.pwm_pub = self.create_publisher(SetPWMServoState, 'ros_robot_controller/pwm_servo/set_state', 10)
