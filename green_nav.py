@@ -4,6 +4,7 @@
 import os
 import math
 import threading
+import time
 import cv2
 import numpy as np
 import rclpy
@@ -133,6 +134,8 @@ class GreenLineFollowingNode(Node):
         self.use_color_picker = False  # lock to green
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.last_image_ts = None
+        self.image_topic = self._resolve_image_topic()
         self.lidar_type = os.environ.get('LIDAR_TYPE')
         self.machine_type = os.environ.get('MACHINE_TYPE')
         self.pwm_pub = self.create_publisher(SetPWMServoState, 'ros_robot_controller/pwm_servo/set_state', 10)
@@ -143,6 +146,7 @@ class GreenLineFollowingNode(Node):
         self.create_service(SetBool, '~/set_running', self.set_running_srv_callback)
         self.create_service(SetFloat64, '~/set_threshold', self.set_threshold_srv_callback)
         self.joints_pub = self.create_publisher(ServosPosition, 'servo_controller', 1)
+        self.create_timer(5.0, self._image_watchdog)
 
         Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))
         self.debug = bool(self.get_parameter('debug').value)
@@ -153,6 +157,22 @@ class GreenLineFollowingNode(Node):
         if self.debug:
             # rclpy logger already prints to terminal; keep messages concise.
             self.get_logger().info(f"[debug] {message}")
+
+    def _resolve_image_topic(self) -> str:
+        if self.camera_type == 'aurora':
+            return 'aurora/camera_publisher/rgb0/image'
+        if self.camera_type == 'usb_cam':
+            return 'camera/image'
+        return 'ascamera/camera_publisher/rgb0/image'
+
+    def _image_watchdog(self):
+        if not self.debug:
+            return
+        now = time.time()
+        if self.last_image_ts is None:
+            self.log_debug("Waiting for first image on topic: " + self.image_topic)
+        elif now - self.last_image_ts > 5.0:
+            self.log_debug(f"No images received for {now - self.last_image_ts:.1f}s on {self.image_topic}")
 
     def pwm_controller(self, position_data):
         pwm_list = []
@@ -180,7 +200,8 @@ class GreenLineFollowingNode(Node):
             self.empty = 0
             self.log_debug("Entering green_nav: reset PID and thresholds; creating subscriptions if needed.")
             if self.image_sub is None:
-                self.image_sub = self.create_subscription(Image, 'ascamera/camera_publisher/rgb0/image', self.image_callback, 1)
+                self.image_sub = self.create_subscription(Image, self.image_topic, self.image_callback, 1)
+                self.log_debug(f"Subscribed to image topic: {self.image_topic}")
             if self.lidar_sub is None:
                 qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
                 self.lidar_sub = self.create_subscription(LaserScan, '/scan_raw', self.lidar_callback, qos)
@@ -275,6 +296,7 @@ class GreenLineFollowingNode(Node):
         rgb_image = np.array(cv_image, dtype=np.uint8)
         self.image_height, self.image_width = rgb_image.shape[:2]
         result_image = np.copy(rgb_image)
+        self.last_image_ts = time.time()
         with self.lock:
             twist = Twist()
             if self.follower is None:
