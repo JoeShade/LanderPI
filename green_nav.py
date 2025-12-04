@@ -166,7 +166,7 @@ class GreenLineFollowingNode(Node):
 
         Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))
         self.debug = bool(self.get_parameter('debug').value)
-        self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, using LAB key={self.lab_lookup_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
+        self.log_debug(f"Debug logging enabled. DEPTH_CAMERA_TYPE={self.camera_type}, LIDAR_TYPE={self.lidar_type}, MACHINE_TYPE={self.machine_type}")
         self.log_debug(f"Stop threshold set to {self.stop_threshold} meters (adjust with parameter stop_threshold)")
         self.log_debug(f"Turn scale set to {self.turn_scale} (adjust with parameter turn_scale)")
         self.get_logger().info('\033[1;32m%s\033[0m' % 'green_nav start')
@@ -334,11 +334,9 @@ class GreenLineFollowingNode(Node):
             lab_config = lab_map.get(self.lab_lookup_type, {}).get(self.color)
             if lab_config is None and 'ascamera' in lab_map:
                 lab_config = lab_map['ascamera'].get(self.color)
-                self.log_debug(f"Falling back to LAB config key: ascamera")
             if lab_config is None and lab_map:
                 first_key = next(iter(lab_map))
                 lab_config = lab_map[first_key].get(self.color)
-                self.log_debug(f"Falling back to LAB config key: {first_key}")
             if lab_config is None:
                 self.get_logger().error("LAB config missing for selected color; cannot proceed.")
                 return
