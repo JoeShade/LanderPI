@@ -20,6 +20,7 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from ros_robot_controller_msgs.msg import SetPWMServoState, PWMServoState
 from servo_controller_msgs.msg import ServosPosition
 from servo_controller.bus_servo_control import set_servo_position
+from xf_mic_asr_offline import voice_play
 from cv_bridge import CvBridge
 from app.common import Heart
 
@@ -117,6 +118,10 @@ class GreenLineFollowingNode(Node):
         self.searching_for_green = True
         self.lost_frames = 0
         self.lost_frame_limit = 5
+        self.language = os.environ.get('ASR_LANGUAGE', 'Chinese')
+        self.announced_search = False
+        self.announced_acquired = False
+        self.announced_avoidance = False
         # Allow tuning how fast the robot spins while searching.
         self.search_angular_speed = float(self.declare_parameter('search_angular_speed', 0.2).value)
         # Whether to spin in place while searching (vs. slow turning).
@@ -191,6 +196,12 @@ class GreenLineFollowingNode(Node):
         if self.debug:
             # rclpy logger already prints to terminal; keep messages concise.
             self.get_logger().info(f"[debug] {message}")
+
+    def _play_voice(self, name: str):
+        try:
+            voice_play.play(name, language=self.language)
+        except Exception as e:
+            self.get_logger().error(f"Voice playback failed for {name}: {e}")
 
     def _resolve_image_topic(self) -> str:
         if self.camera_type == 'aurora':
@@ -429,6 +440,28 @@ class GreenLineFollowingNode(Node):
                 self.searching_for_green = False
                 self.lost_frames = 0
                 self.last_seen_green_ts = time.time()
+
+            has_target = deflection_angle is not None
+            searching_now = self.is_running and self.searching_for_green and not self.stop
+            avoidance_now = self.is_running and self.avoidance_engaged
+
+            if searching_now and not self.announced_search:
+                self._play_voice('start_track_green')
+                self.announced_search = True
+                self.announced_acquired = False
+            elif not searching_now:
+                self.announced_search = False
+
+            if has_target and self.is_running and not self.announced_acquired:
+                self._play_voice('find_target')
+                self.announced_acquired = True
+                self.announced_search = False
+
+            if avoidance_now and not self.announced_avoidance:
+                self._play_voice('warnning')
+                self.announced_avoidance = True
+            elif not avoidance_now:
+                self.announced_avoidance = False
             if deflection_angle is not None and self.is_running and not self.stop:
                 self.pid.update(deflection_angle)
                 pid_scale = 1.0
