@@ -4,6 +4,8 @@
 import os
 import math
 import threading
+import tempfile
+import errno
 import time
 import cv2
 import numpy as np
@@ -101,6 +103,7 @@ class GreenLineFollowingNode(Node):
 
     # Prevent multiple OpenCV windows when multiple nodes are started.
     window_claimed = False
+    window_lock_path = os.path.join(tempfile.gettempdir(), "green_nav_window.lock")
 
     def __init__(self, name: str):
         rclpy.init()
@@ -149,6 +152,7 @@ class GreenLineFollowingNode(Node):
         self.window_name = "green_nav"
         self.window_initialized = False
         self.window_enabled = False
+        self.window_lock_handle = None
         self.use_color_picker = False  # lock to green
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
@@ -623,13 +627,20 @@ class GreenLineFollowingNode(Node):
         # Show live camera view in an OpenCV window
         try:
             if not self.window_initialized and not GreenLineFollowingNode.window_claimed:
-                cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
-                GreenLineFollowingNode.window_claimed = True
-                self.window_initialized = True
-                self.window_enabled = True
-            elif not self.window_initialized and GreenLineFollowingNode.window_claimed:
-                self.log_debug("OpenCV window already claimed; skipping duplicate window.")
-            if self.window_initialized:
+                # Attempt to claim a cross-process lock to avoid duplicate windows.
+                try:
+                    flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
+                    self.window_lock_handle = os.open(GreenLineFollowingNode.window_lock_path, flags)
+                    GreenLineFollowingNode.window_claimed = True
+                    self.window_initialized = True
+                    self.window_enabled = True
+                    cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                except OSError as e:
+                    if e.errno == errno.EEXIST:
+                        self.log_debug("OpenCV window already claimed (lockfile exists); skipping duplicate window.")
+                    else:
+                        self.get_logger().error(f"Failed to claim window lock: {e}")
+            if self.window_initialized and self.window_enabled:
                 cv2.imshow(self.window_name, cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR))
                 cv2.waitKey(1)
         except Exception as e:
@@ -645,6 +656,13 @@ def main():
         if node.window_initialized and node.window_enabled:
             cv2.destroyWindow(node.window_name)
             GreenLineFollowingNode.window_claimed = False
+            try:
+                if node.window_lock_handle is not None:
+                    os.close(node.window_lock_handle)
+                if os.path.exists(GreenLineFollowingNode.window_lock_path):
+                    os.remove(GreenLineFollowingNode.window_lock_path)
+            except Exception:
+                pass
     except Exception:
         pass
     node.destroy_node()
