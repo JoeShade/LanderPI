@@ -123,6 +123,8 @@ class GreenLineFollowingNode(Node):
         self.voice_base = os.environ.get('VOICE_FEEDBACK_PATH') or os.path.join(os.path.dirname(__file__), 'feedback_voice')
         os.environ.setdefault('VOICE_FEEDBACK_PATH', self.voice_base)
         self.voice_enabled = bool(self.declare_parameter('voice_feedback', True).value)
+        self.voice_cooldown = 15.0
+        self.last_voice_played = {}
         self.announced_search = False
         self.announced_acquired = False
         self.announced_avoidance = False
@@ -213,9 +215,17 @@ class GreenLineFollowingNode(Node):
         """Lightweight inlined audio playback so we do not depend on voice_play."""
         if not self.voice_enabled:
             return
+        path = self._voice_path(name)
+        now = time.time()
+        last_played = self.last_voice_played.get(path)
+        if last_played is not None and (now - last_played) < self.voice_cooldown:
+            remaining = self.voice_cooldown - (now - last_played)
+            self.log_debug(f"Voice playback skipped for {path}; {remaining:.1f}s cooldown remaining.")
+            return
         try:
             speech.set_volume(volume)
-            speech.play_audio(self._voice_path(name))
+            speech.play_audio(path)
+            self.last_voice_played[path] = now
         except Exception as e:
             self.get_logger().error(f"Voice playback failed for {name}: {e}")
 
