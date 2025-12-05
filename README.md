@@ -1,5 +1,7 @@
 Useful commands
 
+// Green Nav program commands
+
 // Launch required topics
 ros2 launch green_nav_pkg green_nav_with_sensors.launch.py 
 
@@ -9,8 +11,6 @@ ros2 run green_nav_pkg green_nav --ros-args -p debug:=true
 // Launch program
 ros2 service call /green_nav/enter std_srvs/srv/Trigger {}
 
-// Start program
-ros2 service call /green_nav/set_running std_srvs/srv/SetBool "{data: true}"
 
 // Rebuild package
 Navigate to ros2_ws
