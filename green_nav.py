@@ -83,7 +83,7 @@ class LineFollower:
         contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
         max_contour_area = self.get_area_max_contour(contours, self.min_contour_area)
         if max_contour_area is None:
-            return result_image, None
+            return result_image, None, None, 0.0
 
         rect = cv2.minAreaRect(max_contour_area[0])
         box = np.intp(cv2.boxPoints(rect))
@@ -95,7 +95,9 @@ class LineFollower:
         cv2.circle(result_image, (int(center_x), int(center_y)), 5, (0, 0, 255), -1)
 
         deflection_angle = -math.atan((center_x - (w / 2.0)) / (h / 2.0))
-        return result_image, deflection_angle
+        contour_area = max_contour_area[1]
+        area_ratio = contour_area / max(float(w * h), 1e-6)
+        return result_image, deflection_angle, contour_area, area_ratio
 
 
 class GreenLineFollowingNode(Node):
@@ -173,6 +175,16 @@ class GreenLineFollowingNode(Node):
         self.emergency_retreat_until = None
         self.avoidance_engaged = False
         self.avoidance_in_progress = False  # lockout flag so avoidance doesn't retrigger while active
+        self.avoidance_trigger_streak = int(self.declare_parameter('avoidance_trigger_streak', 2).value)
+        self.obstacle_close_streak = 0
+        self.current_area_ratio = 0.0
+        self.near_target_area_ratio = float(self.declare_parameter('near_target_area_ratio', 0.08).value)
+        self.near_target_activation_scale = float(self.declare_parameter('near_target_activation_scale', 0.5).value)
+        self.near_target_bias_gain = float(self.declare_parameter('near_target_bias_gain', 3.0).value)
+        self.target_reached_area_ratio = float(self.declare_parameter('target_reached_area_ratio', 0.06).value)
+        self.target_spin_rate_multiplier = float(self.declare_parameter('target_spin_rate_multiplier', 1.0).value)
+        self.target_spin_until = None
+        self.target_spin_rate = 0.0
         self.last_avoidance_turn_sign = 1
         self.avoidance_side_hysteresis = float(self.declare_parameter('avoidance_side_hysteresis', 0.05).value)
         self.smoothed_avoidance_bias = 0.0
@@ -382,45 +394,57 @@ class GreenLineFollowingNode(Node):
             self.avoidance_engaged = False
             self.avoidance_turn_in_place = False
             self.min_front_distance = math.inf
-            if len(min_dist_left_) > 0 and len(min_dist_right_) > 0:
-                left_window = left_range[left_nonzero][left_nonan]
-                right_window = right_range[right_nonzero][right_nonan]
-                left_avg = float(np.median(left_window)) if len(left_window) > 0 else math.inf
-                right_avg = float(np.median(right_window)) if len(right_window) > 0 else math.inf
-                min_front = min(left_avg, right_avg)
-                self.min_front_distance = min_front
-                obstacle_close = math.isfinite(min_front) and min_front < self.avoidance_activation_distance
-                if avoidance_already_active:
-                    # Do not retrigger; keep spinning until clear enough to drop lockout.
-                    if obstacle_close:
-                        self.avoidance_engaged = True
-                        self.avoidance_turn_in_place = True
-                        self.log_debug(f"[avoid] locked; still too close (min_front={min_front:.2f} < {self.avoidance_activation_distance})")
-                    else:
-                        self.avoidance_in_progress = False
-                        self.smoothed_avoidance_bias *= 0.5
-                        self.log_debug("[avoid] clearance detected; unlocking avoidance")
-                elif obstacle_close:
+        if len(min_dist_left_) > 0 and len(min_dist_right_) > 0:
+            left_window = left_range[left_nonzero][left_nonan]
+            right_window = right_range[right_nonzero][right_nonan]
+            left_avg = float(np.median(left_window)) if len(left_window) > 0 else math.inf
+            right_avg = float(np.median(right_window)) if len(right_window) > 0 else math.inf
+            min_front = min(left_avg, right_avg)
+            self.min_front_distance = min_front
+            activation_distance = self.avoidance_activation_distance
+            if self.current_area_ratio >= self.near_target_area_ratio:
+                activation_distance = max(self.avoidance_activation_distance * self.near_target_activation_scale, 0.05)
+            obstacle_close = math.isfinite(min_front) and min_front < activation_distance
+            if obstacle_close:
+                self.obstacle_close_streak += 1
+            else:
+                self.obstacle_close_streak = 0
+            if avoidance_already_active:
+                # Do not retrigger; keep spinning until clear enough to drop lockout.
+                if obstacle_close:
                     self.avoidance_engaged = True
                     self.avoidance_turn_in_place = True
-                    self.avoidance_in_progress = True
-                    just_triggered_avoidance = True
-                    diff = (right_avg - left_avg)  # negative means obstacle is closer on the right
-                    if abs(diff) > self.avoidance_side_hysteresis:
-                        self.last_avoidance_turn_sign = 1 if diff > 0 else -1
-                    # Keep turning the same way inside the hysteresis band to avoid oscillation.
-                    biased_diff = diff if abs(diff) > self.avoidance_side_hysteresis else self.last_avoidance_turn_sign * self.avoidance_side_hysteresis
-                    normalized = biased_diff / max(self.avoidance_activation_distance, 1e-3)
-                    normalized = common.set_range(normalized, -1.0, 1.0)
-                    raw_bias = common.set_range(normalized, -self.max_avoidance_turn, self.max_avoidance_turn)
-                    # Smooth bias to reduce fish-tailing.
-                    self.obstacle_avoidance_bias = 0.5 * self.smoothed_avoidance_bias + 0.5 * raw_bias
-                    self.smoothed_avoidance_bias = self.obstacle_avoidance_bias
-                    self.log_debug(f"[avoid] engaged: left={left_avg:.2f}, right={right_avg:.2f}, diff={diff:.2f}, bias={self.obstacle_avoidance_bias:.2f}, min_front={min_front:.2f}, activation={self.avoidance_activation_distance}, hysteresis={self.avoidance_side_hysteresis}, turn_in_place={self.avoidance_turn_in_place}")
-                elif math.isfinite(min_front):
-                    # Decay smoothed bias when not engaged.
+                    self.log_debug(f"[avoid] locked; still too close (min_front={min_front:.2f} < {activation_distance})")
+                else:
+                    self.avoidance_in_progress = False
                     self.smoothed_avoidance_bias *= 0.5
-                    self.log_debug(f"[avoid] ahead but outside activation: left={left_avg:.2f}, right={right_avg:.2f}, min_front={min_front:.2f}, activation={self.avoidance_activation_distance}")
+                    self.log_debug("[avoid] clearance detected; unlocking avoidance")
+            elif obstacle_close and self.obstacle_close_streak >= self.avoidance_trigger_streak:
+                self.avoidance_engaged = True
+                self.avoidance_turn_in_place = True
+                self.avoidance_in_progress = True
+                just_triggered_avoidance = True
+                diff = (right_avg - left_avg)  # negative means obstacle is closer on the right
+                if abs(diff) > self.avoidance_side_hysteresis:
+                    self.last_avoidance_turn_sign = 1 if diff > 0 else -1
+                # Keep turning the same way inside the hysteresis band to avoid oscillation.
+                biased_diff = diff if abs(diff) > self.avoidance_side_hysteresis else self.last_avoidance_turn_sign * self.avoidance_side_hysteresis
+                normalized = biased_diff / max(activation_distance, 1e-3)
+                normalized = common.set_range(normalized, -1.0, 1.0)
+                raw_bias = common.set_range(normalized, -self.max_avoidance_turn, self.max_avoidance_turn)
+                if self.current_area_ratio >= self.near_target_area_ratio:
+                    raw_bias *= self.near_target_bias_gain
+                    raw_bias = common.set_range(raw_bias, -self.max_avoidance_turn, self.max_avoidance_turn)
+                # Smooth bias to reduce fish-tailing.
+                self.obstacle_avoidance_bias = 0.5 * self.smoothed_avoidance_bias + 0.5 * raw_bias
+                self.smoothed_avoidance_bias = self.obstacle_avoidance_bias
+                self.log_debug(f"[avoid] engaged: left={left_avg:.2f}, right={right_avg:.2f}, diff={diff:.2f}, bias={self.obstacle_avoidance_bias:.2f}, min_front={min_front:.2f}, activation={activation_distance}, hysteresis={self.avoidance_side_hysteresis}, turn_in_place={self.avoidance_turn_in_place}")
+            elif obstacle_close:
+                self.log_debug(f"[avoid] close but below streak: streak={self.obstacle_close_streak}/{self.avoidance_trigger_streak}, min_front={min_front:.2f}, activation={activation_distance}")
+            elif math.isfinite(min_front):
+                # Decay smoothed bias when not engaged.
+                self.smoothed_avoidance_bias *= 0.5
+                self.log_debug(f"[avoid] ahead but outside activation: left={left_avg:.2f}, right={right_avg:.2f}, min_front={min_front:.2f}, activation={activation_distance}")
 
             if just_triggered_avoidance:
                 # Publish an immediate stop to cut motion as soon as avoidance is engaged.
@@ -470,10 +494,13 @@ class GreenLineFollowingNode(Node):
             base_speed = self.base_forward_speed  # Speed variable
             twist.linear.x = base_speed
             avoid_correction = self.avoidance_weight * self.obstacle_avoidance_bias
+            activation_distance = self.avoidance_activation_distance
+            if self.current_area_ratio >= self.near_target_area_ratio:
+                activation_distance = max(self.avoidance_activation_distance * self.near_target_activation_scale, 0.05)
             if self.avoidance_engaged:
                 dist_scale = common.set_range(
-                    (self.min_front_distance if math.isfinite(self.min_front_distance) else self.avoidance_activation_distance)
-                    / max(self.avoidance_activation_distance, 1e-3),
+                    (self.min_front_distance if math.isfinite(self.min_front_distance) else activation_distance)
+                    / max(activation_distance, 1e-3),
                     0.1,
                     1.0,
                 )
@@ -515,13 +542,14 @@ class GreenLineFollowingNode(Node):
                 self.get_logger().error("LAB config missing for selected color; cannot proceed.")
                 return
 
-            result_image, deflection_angle = self.follower(
+            result_image, deflection_angle, contour_area, area_ratio = self.follower(
                 rgb_image,
                 result_image,
                 self.threshold,
                 lab_config,
                 False,
             )
+            self.current_area_ratio = area_ratio or 0.0
             if self.avoidance_in_progress:
                 # Ignore target tracking while avoidance is active to prevent conflicting navigation commands.
                 deflection_angle = None
@@ -531,6 +559,7 @@ class GreenLineFollowingNode(Node):
             if retreat_active:
                 # Suppress navigation during emergency retreat.
                 deflection_angle = None
+            target_reached = False
             just_entered_turn_in_place = self.avoidance_turn_in_place and not self.prev_avoidance_turn_in_place
             self.prev_avoidance_turn_in_place = self.avoidance_turn_in_place
             if deflection_angle is not None:
@@ -563,6 +592,16 @@ class GreenLineFollowingNode(Node):
                 # Ensure a full stop before initiating turn-in-place avoidance.
                 self.log_debug("[avoid] entering turn-in-place; sending stop before spin")
                 self.mecanum_pub.publish(Twist())
+            spin_active = self.target_spin_until is not None and now < self.target_spin_until
+            if not spin_active and self.target_spin_until is not None and now >= self.target_spin_until:
+                # Finish spin: stop and clear.
+                self.target_spin_until = None
+                self.mecanum_pub.publish(Twist())
+                self.log_debug("[target] spin complete; stopping.")
+            if spin_active:
+                twist.angular.z = self.target_spin_rate
+                twist.linear.x = 0.0
+                self.mecanum_pub.publish(twist)
             if retreat_active and self.is_running:
                 twist.angular.z = 0.0
                 twist.linear.x = -self.base_forward_speed
@@ -573,27 +612,49 @@ class GreenLineFollowingNode(Node):
                 twist.linear.x = max(twist.linear.x, base_speed)
                 self.mecanum_pub.publish(twist)
             elif deflection_angle is not None and self.is_running and not self.stop:
-                self.pid.update(deflection_angle)
-                pid_scale = 1.0
-                if self.avoidance_engaged:
-                    pid_scale = 0.4 if self.avoidance_turn_in_place else 0.7
-                    # Halt forward motion while obstacle avoidance is active.
-                    twist.linear.x = 0.0
-                if 'Acker' in self.machine_type:
-                    steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
-                    if steering_angle != 0:
-                        R = 0.145 / math.tan(steering_angle)
-                        twist.angular.z = self.turn_scale * (twist.linear.x / R) * pid_scale
-                else:
-                    twist.angular.z = self.turn_scale * common.set_range(-self.pid.output, -1.0, 1.0) * pid_scale
-                twist.angular.z += common.set_range(avoid_correction, -self.max_avoidance_turn, self.max_avoidance_turn)
-                if self.avoidance_turn_in_place:
-                    twist.linear.x = 0.0
-                    turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain
-                    turn_rate = max(turn_rate, self.min_avoidance_turn_in_place)
-                    twist.angular.z = turn_rate * self.last_avoidance_turn_sign
-                    self.log_debug(f"Turning in place to avoid obstacle; angular={twist.angular.z:.2f}, front={self.min_front_distance:.2f}")
-                self.mecanum_pub.publish(twist)
+                if area_ratio >= self.target_reached_area_ratio:
+                    target_reached = True
+                    self.is_running = False
+                    self.searching_for_green = False
+                    self.avoidance_engaged = False
+                    self.avoidance_in_progress = False
+                    self.avoidance_turn_in_place = False
+                    self.advance_after_probe_until = None
+                    self.obstacle_avoidance_bias = 0.0
+                    self.smoothed_avoidance_bias = 0.0
+                    self.mecanum_pub.publish(Twist())
+                    self.log_debug(f"Target reached: area_ratio={area_ratio:.3f} (threshold={self.target_reached_area_ratio})")
+                    deflection_angle = None
+                    has_target = False
+                    # Schedule a quick 180° spin in place after reaching the target.
+                    turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain * self.target_spin_rate_multiplier
+                    turn_rate = max(turn_rate, math.radians(90))
+                    spin_duration = math.pi / max(abs(turn_rate), 1e-3)
+                    self.target_spin_rate = turn_rate
+                    self.target_spin_until = now + spin_duration
+                    self.log_debug(f"Target spin scheduled: rate={turn_rate:.2f} rad/s, duration={spin_duration:.2f}s")
+                if deflection_angle is not None:
+                    self.pid.update(deflection_angle)
+                    pid_scale = 1.0
+                    if self.avoidance_engaged:
+                        pid_scale = 0.4 if self.avoidance_turn_in_place else 0.7
+                        # Halt forward motion while obstacle avoidance is active.
+                        twist.linear.x = 0.0
+                    if 'Acker' in self.machine_type:
+                        steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
+                        if steering_angle != 0:
+                            R = 0.145 / math.tan(steering_angle)
+                            twist.angular.z = self.turn_scale * (twist.linear.x / R) * pid_scale
+                    else:
+                        twist.angular.z = self.turn_scale * common.set_range(-self.pid.output, -1.0, 1.0) * pid_scale
+                    twist.angular.z += common.set_range(avoid_correction, -self.max_avoidance_turn, self.max_avoidance_turn)
+                    if self.avoidance_turn_in_place:
+                        twist.linear.x = 0.0
+                        turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain
+                        turn_rate = max(turn_rate, self.min_avoidance_turn_in_place)
+                        twist.angular.z = turn_rate * self.last_avoidance_turn_sign
+                        self.log_debug(f"Turning in place to avoid obstacle; angular={twist.angular.z:.2f}, front={self.min_front_distance:.2f}")
+                    self.mecanum_pub.publish(twist)
             elif self.is_running and self.searching_for_green and not self.stop:
                 # Force spin-in-place while searching so the robot doesn't creep forward.
                 if self.search_spin_in_place:
@@ -627,6 +688,15 @@ class GreenLineFollowingNode(Node):
         # Show live camera view in an OpenCV window
         try:
             if not self.window_initialized and not GreenLineFollowingNode.window_claimed:
+                # Clear stale lockfiles so a crash doesn't block new windows.
+                if os.path.exists(GreenLineFollowingNode.window_lock_path):
+                    try:
+                        mtime = os.path.getmtime(GreenLineFollowingNode.window_lock_path)
+                        if (time.time() - mtime) > 300:
+                            os.remove(GreenLineFollowingNode.window_lock_path)
+                            self.log_debug("Removed stale window lockfile (>5m old).")
+                    except Exception:
+                        pass
                 # Attempt to claim a cross-process lock to avoid duplicate windows.
                 try:
                     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
@@ -635,6 +705,30 @@ class GreenLineFollowingNode(Node):
                     self.window_initialized = True
                     self.window_enabled = True
                     cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+                    # Verify window creation immediately; if it fails, release the lock so another attempt can retry.
+                    try:
+                        cv2.imshow(self.window_name, cv2.cvtColor(result_image, cv2.COLOR_RGB2BGR))
+                        cv2.waitKey(1)
+                    except Exception as init_err:
+                        self.get_logger().error(f"OpenCV window init failed; disabling display: {init_err}")
+                        try:
+                            cv2.destroyWindow(self.window_name)
+                        except Exception:
+                            pass
+                        GreenLineFollowingNode.window_claimed = False
+                        self.window_initialized = False
+                        self.window_enabled = False
+                        if self.window_lock_handle is not None:
+                            try:
+                                os.close(self.window_lock_handle)
+                            except Exception:
+                                pass
+                            self.window_lock_handle = None
+                        if os.path.exists(GreenLineFollowingNode.window_lock_path):
+                            try:
+                                os.remove(GreenLineFollowingNode.window_lock_path)
+                            except Exception:
+                                pass
                 except OSError as e:
                     if e.errno == errno.EEXIST:
                         self.log_debug("OpenCV window already claimed (lockfile exists); skipping duplicate window.")
