@@ -631,7 +631,9 @@ class GreenLineFollowingNode(Node):
                     turn_rate = max(turn_rate, math.radians(90))
                     spin_duration = math.pi / max(abs(turn_rate), 1e-3)
                     self.target_spin_rate = turn_rate
-                    self.target_spin_until = now + spin_duration
+                    self._play_voice('success.wav')
+                    spin_start = time.time()
+                    self.target_spin_until = spin_start + spin_duration
                     self.log_debug(f"Target spin scheduled: rate={turn_rate:.2f} rad/s, duration={spin_duration:.2f}s")
                 if deflection_angle is not None:
                     self.pid.update(deflection_angle)
