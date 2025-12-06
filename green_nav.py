@@ -1,50 +1,60 @@
 #!/usr/bin/env python3
 # encoding: utf-8
+"""ROS 2 node that follows a green beacon with the RGB camera while dodging obstacles with lidar."""
 
-import os
-import math
-import threading
-import tempfile
 import errno
+import math
+import os
+import tempfile
+import threading
 import time
 import cv2
 import numpy as np
 import rclpy
-import sdk.pid as pid
 import sdk.common as common
+import sdk.pid as pid
+from app.common import Heart
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
+from interfaces.srv import SetFloat64
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from geometry_msgs.msg import Twist
-from std_srvs.srv import SetBool, Trigger
-from sensor_msgs.msg import Image, LaserScan
-from interfaces.srv import SetFloat64
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
-from ros_robot_controller_msgs.msg import SetPWMServoState, PWMServoState
-from servo_controller_msgs.msg import ServosPosition
+from ros_robot_controller_msgs.msg import PWMServoState, SetPWMServoState
+from sensor_msgs.msg import Image, LaserScan
 from servo_controller.bus_servo_control import set_servo_position
+from servo_controller_msgs.msg import ServosPosition
 from speech import speech
-from cv_bridge import CvBridge
-from app.common import Heart
+from std_srvs.srv import SetBool, Trigger
 
 
-MAX_SCAN_ANGLE = 240  # degree (lidar scanning angle used for obstacle checks)
+# ----------------------------
+# Global configuration & flags
+# ----------------------------
+PROGRAM_NAME = "green_nav"
+WINDOW_NAME = "green_nav"
+WINDOW_LOCK_PATH = os.path.join(tempfile.gettempdir(), "green_nav_window.lock")
+MAX_SCAN_ANGLE = 240  # degrees of the lidar scan considered for avoidance
+DEFAULT_COLOR = "green"
+DEFAULT_LOG_INTERVAL = 15  # frames between debug prints
+DEFAULT_THRESHOLD = 0.6  # initial LAB tolerance for green detection
+DEFAULT_STOP_THRESHOLD = 0.15  # meters before we issue an emergency stop
+DEFAULT_TURN_SCALE = 0.5  # scales PID angular output
+DEFAULT_BASE_FORWARD_SPEED = 0.15  # meters per second
+DEFAULT_SEARCH_ANGULAR_SPEED = 0.2  # rad/s spin when looking for the beacon
+DEFAULT_SEARCH_SPIN_IN_PLACE = True  # spin instead of creeping forward when searching
+DEFAULT_VOICE_COOLDOWN = 15.0  # seconds between repeated voice prompts
+VOICE_FEEDBACK_DEFAULT = True  # global flag so voice can be toggled from one place
 
 
+# -------------
+# Vision helper
+# -------------
 class LineFollower:
-    """Minimal in-package copy of the line follower used by green_nav."""
+    """Detects the green target and returns how far off-center it sits."""
 
     def __init__(self, color, node):
         self.node = node
-        self.target_lab, self.target_rgb = color
-        self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
-        # Vertical stripe ROIs: left, center, right (full height), center weighted highest.
-        self.rois = (
-            (0.0, 1.0, 0.00, 0.33, 0.2),
-            (0.0, 1.0, 0.33, 0.66, 0.6),
-            (0.0, 1.0, 0.66, 1.00, 0.2),
-        )
-
-        self.weight_sum = sum(roi[-1] for roi in self.rois) or 1.0
         self.min_contour_area = 12  # slightly more permissive to catch distant targets
 
     @staticmethod
@@ -56,24 +66,13 @@ class LineFollower:
             return max_c_a
         return None
 
-    def __call__(self, image, result_image, threshold, color=None, use_color_picker=True):
+    def __call__(self, image, result_image, threshold, color):
+        """Locate the largest green patch and report how far it sits from image center."""
         h, w = image.shape[:2]
         if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
             w = w + 200
-        if use_color_picker:
-            # Wider LAB tolerance for green detection.
-            min_color = [int(self.target_lab[0] - 70 * threshold * 2),
-                         int(self.target_lab[1] - 70 * threshold),
-                         int(self.target_lab[2] - 70 * threshold)]
-            max_color = [int(self.target_lab[0] + 70 * threshold * 2),
-                         int(self.target_lab[1] + 70 * threshold),
-                         int(self.target_lab[2] + 70 * threshold)]
-            target_color = self.target_lab, min_color, max_color
-            lowerb = tuple(target_color[1])
-            upperb = tuple(target_color[2])
-        else:
-            lowerb = tuple(color['min'])
-            upperb = tuple(color['max'])
+        lowerb = tuple(color['min'])
+        upperb = tuple(color['max'])
         # Single global mask and single bounding box
         img_lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
         img_blur = cv2.GaussianBlur(img_lab, (5, 5), 3)
@@ -95,67 +94,64 @@ class LineFollower:
         cv2.circle(result_image, (int(center_x), int(center_y)), 5, (0, 0, 255), -1)
 
         deflection_angle = -math.atan((center_x - (w / 2.0)) / (h / 2.0))
-        contour_area = max_contour_area[1]
-        area_ratio = contour_area / max(float(w * h), 1e-6)
-        return result_image, deflection_angle, contour_area, area_ratio
+        area_ratio = max_contour_area[1] / max(float(w * h), 1e-6)
+        return result_image, deflection_angle, area_ratio
 
 
 class GreenLineFollowingNode(Node):
-    #Line follower locked to a green target; color picker is disabled."
+    """ROS node orchestrating vision, lidar avoidance, and wheel commands."""
 
     # Prevent multiple OpenCV windows when multiple nodes are started.
     window_claimed = False
-    window_lock_path = os.path.join(tempfile.gettempdir(), "green_nav_window.lock")
+    window_lock_path = WINDOW_LOCK_PATH
 
     def __init__(self, name: str):
         rclpy.init()
         super().__init__(name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
 
+        # Identity and high-level state
         self.name = name
-        self.color = "green"
+        self.color = DEFAULT_COLOR
         self.frame_count = 0
-        self.log_interval = 15
-        self.set_callback = False
+        self.log_interval = DEFAULT_LOG_INTERVAL
+
+        # Run/stop flags adjusted by services
         self.is_running = False
-        self.follower = None
-        self.scan_angle = math.radians(45)
-        self.pid = pid.PID(0.020, 0.003, 0.0)
-        self.empty = 0
-        self.count = 0
         self.stop = False
         self.searching_for_green = True
         self.lost_frames = 0
         self.lost_frame_limit = 5
-        self.language = os.environ.get('ASR_LANGUAGE', 'Chinese')
-        # Keep green_nav audio alongside this file unless VOICE_FEEDBACK_PATH is set.
+        self.count = 0  # lidar streak counter used for clearing stop states
+
+        # Vision/PID helpers
+        self.follower = None
+        self.scan_angle = math.radians(45)
+        self.pid = pid.PID(0.020, 0.003, 0.0)
+
+        # Voice prompts and cooldowns
         self.voice_base = os.environ.get('VOICE_FEEDBACK_PATH') or os.path.join(os.path.dirname(__file__), 'feedback_voice')
         os.environ.setdefault('VOICE_FEEDBACK_PATH', self.voice_base)
-        self.voice_enabled = bool(self.declare_parameter('voice_feedback', True).value)
-        self.voice_cooldown = 15.0
+        self.voice_enabled = bool(self.declare_parameter('voice_feedback', VOICE_FEEDBACK_DEFAULT).value)
+        self.voice_cooldown = DEFAULT_VOICE_COOLDOWN
         self.last_voice_played = {}
         self.announced_search = False
         self.announced_acquired = False
         self.announced_avoidance = False
-        # Allow tuning how fast the robot spins while searching.
-        self.search_angular_speed = float(self.declare_parameter('search_angular_speed', 0.2).value)
-        # Whether to spin in place while searching (vs. slow turning).
-        self.search_spin_in_place = bool(self.declare_parameter('search_spin_in_place', True).value)
-        self.threshold = 0.6  # wider default tolerance for green
-        # Stop only when obstacles are very close; configurable via parameter.
-        self.stop_threshold = float(self.declare_parameter('stop_threshold', 0.15).value)
-        # Scale turn rate toward the target for smoother steering.
-        self.turn_scale = float(self.declare_parameter('turn_scale', 0.5).value)
+
+        # Search/target tuning; configurable via ROS parameters
+        self.search_angular_speed = float(self.declare_parameter('search_angular_speed', DEFAULT_SEARCH_ANGULAR_SPEED).value)
+        self.search_spin_in_place = bool(self.declare_parameter('search_spin_in_place', DEFAULT_SEARCH_SPIN_IN_PLACE).value)
+        self.threshold = DEFAULT_THRESHOLD  # wider default tolerance for green
+        self.stop_threshold = float(self.declare_parameter('stop_threshold', DEFAULT_STOP_THRESHOLD).value)
+        self.turn_scale = float(self.declare_parameter('turn_scale', DEFAULT_TURN_SCALE).value)
         self.lock = threading.RLock()
         self.image_sub = None
         self.lidar_sub = None
-        self.image_height = None
-        self.image_width = None
         self.bridge = CvBridge()
-        self.window_name = "green_nav"
+        self.window_name = WINDOW_NAME
         self.window_initialized = False
         self.window_enabled = False
         self.window_lock_handle = None
-        self.use_color_picker = False  # lock to green
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
         lab_map = self.lab_data.get('lab', {})
@@ -169,7 +165,7 @@ class GreenLineFollowingNode(Node):
         self.avoidance_turn_in_place_gain = float(self.declare_parameter('avoidance_turn_in_place_gain', 2.5).value)
         self.min_avoidance_turn_in_place = float(self.declare_parameter('min_avoidance_turn_in_place', math.radians(80)).value)
         self.min_forward_after_probe = float(self.declare_parameter('min_forward_after_probe', 0.50).value)
-        self.base_forward_speed = 0.15
+        self.base_forward_speed = DEFAULT_BASE_FORWARD_SPEED
         self.emergency_retreat_distance = 0.20  # meters to back up on emergency stop
         self.emergency_stop_active = False
         self.emergency_retreat_until = None
@@ -192,6 +188,7 @@ class GreenLineFollowingNode(Node):
         self.prev_avoidance_turn_in_place = False
         self.advance_after_probe_until = None
         self.min_front_distance = math.inf
+        self.last_seen_green_ts = None
         # Handle auto-declared params (automatically_declare_parameters_from_overrides=True) without double-declare crashes.
         image_topic_param = self.get_parameter('image_topic')
         if image_topic_param.type_ == Parameter.Type.NOT_SET or image_topic_param.value is None:
@@ -223,6 +220,9 @@ class GreenLineFollowingNode(Node):
         self.log_debug(f"Turn scale set to {self.turn_scale} (adjust with parameter turn_scale)")
         self.get_logger().info('\033[1;32m%s\033[0m' % 'green_nav start')
 
+    # -----------------------------
+    # Logging and voice prompt tools
+    # -----------------------------
     def log_debug(self, message: str):
         if self.debug:
             # rclpy logger already prints to terminal; keep messages concise.
@@ -254,6 +254,70 @@ class GreenLineFollowingNode(Node):
         except Exception as e:
             self.get_logger().error(f"Voice playback failed for {name}: {e}")
 
+    def _get_lab_config(self):
+        """Return the LAB config for green, falling back across camera types."""
+        lab_map = self.lab_data.get('lab', {})
+        lab_config = lab_map.get(self.lab_lookup_type, {}).get(self.color)
+        if lab_config is None and 'ascamera' in lab_map:
+            lab_config = lab_map['ascamera'].get(self.color)
+        if lab_config is None and lab_map:
+            first_key = next(iter(lab_map))
+            lab_config = lab_map[first_key].get(self.color)
+        return lab_config
+
+    def _handle_voice_prompts(self, searching_now, has_target, avoidance_now, just_entered_turn_in_place):
+        """Centralize voice feedback so callers stay shorter and clearer."""
+        if searching_now and not self.announced_search:
+            self._play_voice('start_track_green')
+            self.announced_search = True
+            self.announced_acquired = False
+        elif not searching_now:
+            self.announced_search = False
+
+        if has_target and self.is_running and not self.announced_acquired:
+            self._play_voice('find_target')
+            self.announced_acquired = True
+            self.announced_search = False
+
+        if avoidance_now and not self.announced_avoidance:
+            self._play_voice('warning')
+            self.announced_avoidance = True
+        elif not avoidance_now:
+            self.announced_avoidance = False
+
+        if just_entered_turn_in_place and self.is_running:
+            # Ensure a full stop before initiating turn-in-place avoidance.
+            self.log_debug("[avoid] entering turn-in-place; sending stop before spin")
+            self.mecanum_pub.publish(Twist())
+
+    def _handle_target_reached(self, area_ratio, twist):
+        """Stop the robot and schedule a celebratory spin when green fills the view."""
+        if area_ratio < self.target_reached_area_ratio:
+            return False
+        self.is_running = False
+        self.searching_for_green = False
+        self.avoidance_engaged = False
+        self.avoidance_in_progress = False
+        self.avoidance_turn_in_place = False
+        self.advance_after_probe_until = None
+        self.obstacle_avoidance_bias = 0.0
+        self.smoothed_avoidance_bias = 0.0
+        self.mecanum_pub.publish(Twist())
+        self.log_debug(f"Target reached: area_ratio={area_ratio:.3f} (threshold={self.target_reached_area_ratio})")
+        # Schedule a quick 180-degree spin in place after reaching the target.
+        turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain * self.target_spin_rate_multiplier
+        turn_rate = max(turn_rate, math.radians(90))
+        spin_duration = math.pi / max(abs(turn_rate), 1e-3)
+        self.target_spin_rate = turn_rate
+        self._play_voice('success.wav')
+        spin_start = time.time()
+        self.target_spin_until = spin_start + spin_duration
+        self.log_debug(f"Target spin scheduled: rate={turn_rate:.2f} rad/s, duration={spin_duration:.2f}s")
+        return True
+
+    # -----------------------------
+    # Topic discovery and watchdogs
+    # -----------------------------
     def _resolve_image_topic(self) -> str:
         if self.camera_type == 'aurora':
             # On this platform Aurora images are published under ascamera namespace
@@ -276,9 +340,14 @@ class GreenLineFollowingNode(Node):
             return
         with self.lock:
             if self.is_running and self.searching_for_green and not self.stop:
-                self.log_debug(f"Searching for green… angular z={self.search_angular_speed}")
+                # Reminder while the robot spins to reacquire the beacon.
+                self.log_debug(f"Searching for green target; angular z={self.search_angular_speed}")
 
+    # -----------------------------
+    # Servos and service endpoints
+    # -----------------------------
     def pwm_controller(self, position_data):
+        """Send a small list of servo positions to the controller."""
         pwm_list = []
         msg = SetPWMServoState()
         msg.duration = 0.2
@@ -291,6 +360,7 @@ class GreenLineFollowingNode(Node):
         self.pwm_pub.publish(msg)
 
     def enter_srv_callback(self, request, response):
+        """Start green navigation: reset PID, subscribe topics, and begin searching."""
         self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav enter")
         if os.environ['DEPTH_CAMERA_TYPE'] != 'ascamera':
             self.pwm_controller([1850, 1500])
@@ -301,7 +371,6 @@ class GreenLineFollowingNode(Node):
             self.pid = pid.PID(1.1, 0.0, 0.0)
             self.follower = LineFollower([None, common.range_rgb[self.color]], self)
             self.threshold = 0.5
-            self.empty = 0
             self.log_debug("Entering green_nav: reset PID and thresholds; creating subscriptions if needed.")
             if self.image_sub is None:
                 image_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
@@ -317,6 +386,7 @@ class GreenLineFollowingNode(Node):
         return response
 
     def exit_srv_callback(self, request, response):
+        """Stop navigation and tear down subscriptions so the robot holds still."""
         self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav exit")
         try:
             if self.image_sub is not None:
@@ -339,11 +409,11 @@ class GreenLineFollowingNode(Node):
         return response
 
     def set_running_srv_callback(self, request, response):
+        """Legacy toggle; prefer the enter/exit pair but keep this for compatibility."""
         # Deprecated: enter now starts navigation; this remains for compatibility.
         self.get_logger().info('\033[1;32m%s\033[0m' % "set_running (deprecated)")
         with self.lock:
             self.is_running = request.data
-            self.empty = 0
             if self.is_running:
                 self.searching_for_green = True
             if not self.is_running:
@@ -354,6 +424,7 @@ class GreenLineFollowingNode(Node):
         return response
 
     def set_threshold_srv_callback(self, request, response):
+        """Adjust LAB detection tolerance at runtime; higher values accept more green."""
         self.get_logger().info('\033[1;32m%s\033[0m' % "set threshold")
         with self.lock:
             self.threshold = request.data
@@ -362,8 +433,13 @@ class GreenLineFollowingNode(Node):
             response.message = "set_threshold"
             return response
 
+    # -----------------------------
+    # Sensor callbacks
+    # -----------------------------
     def lidar_callback(self, lidar_data):
+        """Use the lidar scan to bias steering away from nearby obstacles."""
         with self.lock:
+            # Focus on the forward arc and steer toward whichever side has more room.
             previous_turning_in_place = self.avoidance_turn_in_place
             avoidance_already_active = self.avoidance_in_progress
             just_triggered_avoidance = False
@@ -481,9 +557,10 @@ class GreenLineFollowingNode(Node):
                             self.log_debug(f"Lidar clear: left={min_dist_left:.2f}, right={min_dist_right:.2f}")
 
     def image_callback(self, ros_image):
+        """Blend camera target tracking with lidar avoidance and publish velocity commands."""
+        # Convert ROS image message into a format OpenCV understands.
         cv_image = self.bridge.imgmsg_to_cv2(ros_image, "rgb8")
         rgb_image = np.array(cv_image, dtype=np.uint8)
-        self.image_height, self.image_width = rgb_image.shape[:2]
         result_image = np.copy(rgb_image)
         self.last_image_ts = time.time()
         with self.lock:
@@ -491,7 +568,8 @@ class GreenLineFollowingNode(Node):
             now = time.time()
             if self.follower is None:
                 self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-            base_speed = self.base_forward_speed  # Speed variable
+            base_speed = self.base_forward_speed  # forward speed base line
+            # Start with forward motion, then blend in obstacle bias from lidar.
             twist.linear.x = base_speed
             avoid_correction = self.avoidance_weight * self.obstacle_avoidance_bias
             activation_distance = self.avoidance_activation_distance
@@ -530,24 +608,17 @@ class GreenLineFollowingNode(Node):
                     self.obstacle_avoidance_bias = 0.0
                     self.smoothed_avoidance_bias = 0.0
                     self.log_debug("[avoid] emergency retreat complete; resuming navigation")
-            lab_map = self.lab_data.get('lab', {})
-            # Robust LAB selection with fallback to first available entry
-            lab_config = lab_map.get(self.lab_lookup_type, {}).get(self.color)
-            if lab_config is None and 'ascamera' in lab_map:
-                lab_config = lab_map['ascamera'].get(self.color)
-            if lab_config is None and lab_map:
-                first_key = next(iter(lab_map))
-                lab_config = lab_map[first_key].get(self.color)
+            lab_config = self._get_lab_config()
             if lab_config is None:
                 self.get_logger().error("LAB config missing for selected color; cannot proceed.")
                 return
 
-            result_image, deflection_angle, contour_area, area_ratio = self.follower(
+            # Run the vision detector and get steering hints.
+            result_image, deflection_angle, area_ratio = self.follower(
                 rgb_image,
                 result_image,
                 self.threshold,
                 lab_config,
-                False,
             )
             self.current_area_ratio = area_ratio or 0.0
             if self.avoidance_in_progress:
@@ -559,7 +630,6 @@ class GreenLineFollowingNode(Node):
             if retreat_active:
                 # Suppress navigation during emergency retreat.
                 deflection_angle = None
-            target_reached = False
             just_entered_turn_in_place = self.avoidance_turn_in_place and not self.prev_avoidance_turn_in_place
             self.prev_avoidance_turn_in_place = self.avoidance_turn_in_place
             if deflection_angle is not None:
@@ -571,27 +641,7 @@ class GreenLineFollowingNode(Node):
             searching_now = self.is_running and self.searching_for_green and not self.stop
             avoidance_now = self.is_running and self.avoidance_engaged
 
-            if searching_now and not self.announced_search:
-                self._play_voice('start_track_green')
-                self.announced_search = True
-                self.announced_acquired = False
-            elif not searching_now:
-                self.announced_search = False
-
-            if has_target and self.is_running and not self.announced_acquired:
-                self._play_voice('find_target')
-                self.announced_acquired = True
-                self.announced_search = False
-
-            if avoidance_now and not self.announced_avoidance:
-                self._play_voice('warning')
-                self.announced_avoidance = True
-            elif not avoidance_now:
-                self.announced_avoidance = False
-            if just_entered_turn_in_place and self.is_running:
-                # Ensure a full stop before initiating turn-in-place avoidance.
-                self.log_debug("[avoid] entering turn-in-place; sending stop before spin")
-                self.mecanum_pub.publish(Twist())
+            self._handle_voice_prompts(searching_now, has_target, avoidance_now, just_entered_turn_in_place)
             spin_active = self.target_spin_until is not None and now < self.target_spin_until
             if not spin_active and self.target_spin_until is not None and now >= self.target_spin_until:
                 # Finish spin: stop and clear.
@@ -612,29 +662,9 @@ class GreenLineFollowingNode(Node):
                 twist.linear.x = max(twist.linear.x, base_speed)
                 self.mecanum_pub.publish(twist)
             elif deflection_angle is not None and self.is_running and not self.stop:
-                if area_ratio >= self.target_reached_area_ratio:
-                    target_reached = True
-                    self.is_running = False
-                    self.searching_for_green = False
-                    self.avoidance_engaged = False
-                    self.avoidance_in_progress = False
-                    self.avoidance_turn_in_place = False
-                    self.advance_after_probe_until = None
-                    self.obstacle_avoidance_bias = 0.0
-                    self.smoothed_avoidance_bias = 0.0
-                    self.mecanum_pub.publish(Twist())
-                    self.log_debug(f"Target reached: area_ratio={area_ratio:.3f} (threshold={self.target_reached_area_ratio})")
+                if self._handle_target_reached(area_ratio, twist):
                     deflection_angle = None
                     has_target = False
-                    # Schedule a quick 180° spin in place after reaching the target.
-                    turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain * self.target_spin_rate_multiplier
-                    turn_rate = max(turn_rate, math.radians(90))
-                    spin_duration = math.pi / max(abs(turn_rate), 1e-3)
-                    self.target_spin_rate = turn_rate
-                    self._play_voice('success.wav')
-                    spin_start = time.time()
-                    self.target_spin_until = spin_start + spin_duration
-                    self.log_debug(f"Target spin scheduled: rate={turn_rate:.2f} rad/s, duration={spin_duration:.2f}s")
                 if deflection_angle is not None:
                     self.pid.update(deflection_angle)
                     pid_scale = 1.0
@@ -642,13 +672,7 @@ class GreenLineFollowingNode(Node):
                         pid_scale = 0.4 if self.avoidance_turn_in_place else 0.7
                         # Halt forward motion while obstacle avoidance is active.
                         twist.linear.x = 0.0
-                    if 'Acker' in self.machine_type:
-                        steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
-                        if steering_angle != 0:
-                            R = 0.145 / math.tan(steering_angle)
-                            twist.angular.z = self.turn_scale * (twist.linear.x / R) * pid_scale
-                    else:
-                        twist.angular.z = self.turn_scale * common.set_range(-self.pid.output, -1.0, 1.0) * pid_scale
+                    twist.angular.z = self.turn_scale * common.set_range(-self.pid.output, -1.0, 1.0) * pid_scale
                     twist.angular.z += common.set_range(avoid_correction, -self.max_avoidance_turn, self.max_avoidance_turn)
                     if self.avoidance_turn_in_place:
                         twist.linear.x = 0.0
@@ -745,8 +769,12 @@ class GreenLineFollowingNode(Node):
         self.result_publisher.publish(self.bridge.cv2_to_imgmsg(result_image, "rgb8"))
 
 
+# -----------------------------
+# Entrypoint
+# -----------------------------
 def main():
-    node = GreenLineFollowingNode('green_nav')
+    """Spin the ROS node until the user exits."""
+    node = GreenLineFollowingNode(PROGRAM_NAME)
     rclpy.spin(node)
     try:
         if node.window_initialized and node.window_enabled:
