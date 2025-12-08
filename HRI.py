@@ -9,6 +9,10 @@ import sys
 import numpy as np
 import mediapipe as mp
 import os
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    get_package_share_directory = None
 from rclpy.node import Node
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
@@ -40,11 +44,17 @@ class FistStopNode(Node):
         self.name = name
         
         # Audio Setup
-        self.voice_base = os.environ.get('VOICE_FEEDBACK_PATH') or os.path.join(os.path.dirname(__file__), 'feedback_voice')
-        os.environ.setdefault('VOICE_FEEDBACK_PATH', self.voice_base)
-        self.voice_enabled = True
+        self.voice_base = self._resolve_voice_base()
+        self.voice_enabled = bool(self.voice_base)
         self.voice_cooldown = 1.0
         self.last_voice_played = {}
+        if self.voice_base:
+            os.environ.setdefault('VOICE_FEEDBACK_PATH', self.voice_base)
+            self.get_logger().info(f"Voice feedback path: {self.voice_base}")
+            self._log_voice_files()
+        else:
+            self.get_logger().warn("Voice feedback disabled: no feedback_voice directory found. "
+                                   "Set VOICE_FEEDBACK_PATH to a folder containing .wav files (e.g., Danger.wav, Survivor.wav).")
 
         # Hand Detector
         self.hand_detector = mp.solutions.hands.Hands(
@@ -80,12 +90,55 @@ class FistStopNode(Node):
         
         self.get_logger().info('Fist/Wave Node Started. Detects "Fist" (Danger) or "Wave" (Survivor).')
 
+    def _resolve_voice_base(self):
+        """
+        Resolve where to load audio files from.
+        Priority: VOICE_FEEDBACK_PATH env -> package share feedback_voice -> local feedback_voice next to this file.
+        """
+        candidates = []
+        # 1) Prefer folder next to this file (works in source and install space)
+        candidates.append(os.path.join(os.path.dirname(__file__), 'feedback_voice'))
+
+        # 2) Explicit env override
+        env_path = os.environ.get('VOICE_FEEDBACK_PATH')
+        if env_path:
+            candidates.append(env_path)
+
+        # 3) Package share (colcon install space)
+        if get_package_share_directory:
+            try:
+                pkg_share = get_package_share_directory('HRI_pkg')
+                candidates.append(os.path.join(pkg_share, 'feedback_voice'))
+            except Exception:
+                pass
+
+        for path in candidates:
+            if path and os.path.isdir(path):
+                return path
+        return candidates[0] if candidates else None
+
     def _voice_path(self, name: str) -> str:
         base = self.voice_base
         filename = name if os.path.splitext(os.path.basename(name))[1] else name + '.wav'
         if os.path.isabs(filename):
             return filename
         return os.path.join(base, filename)
+
+    def _log_voice_files(self):
+        """Log which wav files are available to help debug missing audio."""
+        if not self.voice_base:
+            return
+        try:
+            files = [f for f in os.listdir(self.voice_base) if f.lower().endswith('.wav')]
+        except FileNotFoundError:
+            self.get_logger().warn(f"Voice path does not exist: {self.voice_base}")
+            return
+
+        if not files:
+            self.get_logger().warn(f"No .wav files found in {self.voice_base}. "
+                                   "Expected files like Danger.wav and Survivor.wav.")
+        else:
+            self.get_logger().info(f"Available voice files: {', '.join(files)}")
 
     def _play_voice(self, name: str, volume: int = 100):
         if not self.voice_enabled:
@@ -256,12 +309,29 @@ class FistStopNode(Node):
         return None
 
     def control_loop(self):
-        # Start gesture recognition immediately in a fixed posture (no panning)
-        self.set_camera_posture('look_up')
+        time.sleep(2) 
         
         while self.running:
-            self.get_logger().info("Monitoring gestures (static, no panning)...")
-            result = self.check_gestures(1.0)
+            #if self.check_attempts >= 3:
+            #    self.rotate_once()
+            #    self.stop_robot()
+            #    self.running = False
+            #    break
+
+            # 1. Prepare to Drive
+            #self.set_camera_posture('drive')
+            
+            # 2. Move Forward
+            #self.get_logger().info(f"Moving Forward ({self.check_attempts + 1}/3)...")
+            #self.move_forward()
+            #time.sleep(3.0) 
+            
+            # 3. Stop
+            #self.stop_robot()
+            
+            # 4. Look Up / Check
+            self.get_logger().info("Scanning for Gestures (Fist/Wave) with arm pan/tilt...")
+            result = self.scan_with_arm()
             
             if result == 'fist':
                 self.get_logger().warn("FIST SEEN! (Danger)")
