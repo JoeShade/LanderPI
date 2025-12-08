@@ -82,7 +82,7 @@ class LineFollower:
         contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
         max_contour_area = self.get_area_max_contour(contours, self.min_contour_area)
         if max_contour_area is None:
-            return result_image, None, None, 0.0
+            return result_image, None, 0.0
 
         rect = cv2.minAreaRect(max_contour_area[0])
         box = np.intp(cv2.boxPoints(rect))
