@@ -170,6 +170,9 @@ class FistStopNode(Node):
         elif mode == 'look_up':
             positions = ((10, 200), (5, 500), (4, 90), (3, 350), (2, 780), (1, 500))
             set_servo_position(self.joints_pub, 1.0, positions)
+        elif mode == 'look_down':
+            positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 550), (1, 500))
+            set_servo_position(self.joints_pub, 1.0, positions)
         time.sleep(0.5)
 
     def stop_robot(self):
@@ -253,52 +256,41 @@ class FistStopNode(Node):
         return None
 
     def control_loop(self):
-        time.sleep(2) 
+        # Start gesture recognition immediately in a fixed posture (no panning)
+        self.set_camera_posture('look_up')
         
         while self.running:
-            #if self.check_attempts >= 3:
-            #    self.rotate_once()
-            #    self.stop_robot()
-            #    self.running = False
-            #    break
-
-            # 1. Prepare to Drive
-            #self.set_camera_posture('drive')
-            
-            # 2. Move Forward
-            #self.get_logger().info(f"Moving Forward ({self.check_attempts + 1}/3)...")
-            #self.move_forward()
-            #time.sleep(3.0) 
-            
-            # 3. Stop
-            #self.stop_robot()
-            
-            # 4. Look Up / Check
-            self.get_logger().info("Scanning for Gestures (Fist/Wave) with arm pan/tilt...")
-            result = self.scan_with_arm()
+            self.get_logger().info("Monitoring gestures (static, no panning)...")
+            result = self.check_gestures(1.0)
             
             if result == 'fist':
                 self.get_logger().warn("FIST SEEN! (Danger)")
                 self._play_voice('Danger') 
-                #self.stop_robot()
+                self.set_camera_posture('look_down')
+                self.stop_robot()
                 self.running = False
                 break
             elif result == 'wave':
                 self.get_logger().warn("WAVE SEEN! (Survivor)")
                 self._play_voice('Survivor') # Make sure survivor.wav exists
-                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 220))
+                # Keep tilt level (no downward tilt) and speed up sweep
+                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 220))  # left
                 set_servo_position(self.joints_pub, 1.0, positions)
-                time.sleep(0.5)
-                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 780))
+                time.sleep(0.25)
+                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 780))  # right
                 set_servo_position(self.joints_pub, 1.0, positions)
-                time.sleep(0.5)
-                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))
+                time.sleep(0.25)
+                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 220))  # back left
                 set_servo_position(self.joints_pub, 1.0, positions)
-                self.running = False
-                break
+                time.sleep(0.25)
+                positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))  # center
+                set_servo_position(self.joints_pub, 1.0, positions)
+                # Return to scanning posture and pause before resuming search
+                self.set_camera_posture('look_up')
+                time.sleep(3.0)
             
             else:
-                self.get_logger().info("No gestures detected in arm scan. Rotating and retrying.")
+                self.get_logger().info("No gestures detected. Rotating and retrying.")
                 self.rotate_quarter_turn()
 
                 
