@@ -71,6 +71,8 @@ class FistStopNode(Node):
         self.fist_detected = False 
         self.wave_detected = False # NEW: Flag for wave
         self.check_attempts = 0 
+        self.fist_hold_start = None
+        self.wave_hold_start = None
         
         # Start Threads
         threading.Thread(target=self.image_proc, daemon=True).start()
@@ -203,6 +205,15 @@ class FistStopNode(Node):
         time.sleep(4.2) 
         self.stop_robot()
 
+    def rotate_quarter_turn(self):
+        """Rotate roughly 90 degrees to continue scanning in a new sector."""
+        twist = Twist()
+        twist.angular.z = 1.5
+        self.get_logger().info("Rotating 90 degrees to continue scanning...")
+        self.mecanum_pub.publish(twist)
+        time.sleep(1.1)  # ~pi/2 at 1.5 rad/s
+        self.stop_robot()
+
     def check_gestures(self, duration):
         """
         Polls for gestures. Returns 'fist', 'wave', or None.
@@ -214,6 +225,31 @@ class FistStopNode(Node):
             if self.wave_detected:
                 return 'wave'
             time.sleep(0.05)
+        return None
+
+    def scan_with_arm(self):
+        """
+        Sweep the camera with pan/tilt instead of rotating the base.
+        Returns 'fist', 'wave', or None based on what is seen during the sweep.
+        """
+        base_pose = ((10, 200), (5, 500), (4, 90), (3, 350))
+        pan_tilt_sequence = [
+            (500, 780),  # center up
+            (220, 780),  # left up
+            (780, 780),  # right up
+            (500, 700),  # center mid
+            (220, 700),  # left mid
+            (780, 700),  # right mid
+        ]
+
+        for pan, tilt in pan_tilt_sequence:
+            positions = base_pose + ((2, tilt), (1, pan))
+            self.get_logger().info(f"Scanning pan={pan}, tilt={tilt}")
+            set_servo_position(self.joints_pub, 1.0, positions)
+            time.sleep(0.3)  # allow movement to settle
+            result = self.check_gestures(1.5)
+            if result:
+                return result
         return None
 
     def control_loop(self):
@@ -238,12 +274,8 @@ class FistStopNode(Node):
             #self.stop_robot()
             
             # 4. Look Up / Check
-            self.get_logger().info("Checking...")
-            self.set_camera_posture('look_up')
-            
-            # 5. Monitor Gestures
-            self.get_logger().info("Scanning for Gestures (Fist/Wave)...")
-            result = self.check_gestures(2.0)
+            self.get_logger().info("Scanning for Gestures (Fist/Wave) with arm pan/tilt...")
+            result = self.scan_with_arm()
             
             if result == 'fist':
                 self.get_logger().warn("FIST SEEN! (Danger)")
@@ -266,9 +298,8 @@ class FistStopNode(Node):
                 break
             
             else:
-                #self.get_logger().info("Nothing detected. Incrementing attempts.")
-                #self.check_attempts += 1
-                self.rotate_opposite()
+                self.get_logger().info("No gestures detected in arm scan. Rotating and retrying.")
+                self.rotate_quarter_turn()
 
                 
         #self.stop_robot()
@@ -304,9 +335,24 @@ class FistStopNode(Node):
                         wave_now = True
                         cv2.putText(bgr_image, "WAVE (SURVIVOR)", (50, 50), 
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            self.fist_detected = fist_now
-            self.wave_detected = wave_now
+
+            now = time.time()
+            # Require ~200ms of continuous presence to reduce sensitivity
+            if fist_now:
+                if self.fist_hold_start is None:
+                    self.fist_hold_start = now
+                self.fist_detected = (now - self.fist_hold_start) >= 0.2
+            else:
+                self.fist_hold_start = None
+                self.fist_detected = False
+
+            if wave_now:
+                if self.wave_hold_start is None:
+                    self.wave_hold_start = now
+                self.wave_detected = (now - self.wave_hold_start) >= 0.2
+            else:
+                self.wave_hold_start = None
+                self.wave_detected = False
             
             cv2.imshow(self.name, bgr_image)
             key = cv2.waitKey(1)
