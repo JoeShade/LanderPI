@@ -13,12 +13,12 @@ This ROS 2 Python package orchestrates the full `line_following.py`, `green_nav.
 
 ## Build the package
 
-1) Place this repository (or at least the `scenario_pkg` folder plus its sibling scripts) inside your ROS 2 workspace `src/` directory (example on target device):
+Copy the scenario package into your workspace:
 ```bash
 cp -r /home/ubuntu/shared/scenario_pkg ~/ros2_ws/src/
 ```
 
-2) Build and source:
+Build and source:
 ```bash
 cd ~/ros2_ws
 rm -rf build/scenario_pkg install/scenario_pkg log/latest
@@ -27,7 +27,7 @@ source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ```
 
-3) Ensure the `scenario_runner` entrypoint exists in the install space (only needed if it did not get generated):
+Ensure the scenario_runner entrypoint exists in the install space:
 ```bash
 mkdir -p ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg
 cat <<'EOF' > ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg/scenario_runner
@@ -38,16 +38,25 @@ chmod +x ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg/scenario_runner
 source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ```
+Copy audio prompts into the scenario manager feedback_voice directory:
+```bash
+cp /home/ubuntu/shared/warning.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/start_track_green.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/find_target.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/Danger.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/Survivor.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+```
+
+Launch the scenario runner:
+```bash
+ros2 launch scenario_pkg scenario.launch.py
+```
 
 ## Launch the scenario
 
 Run the launch file to start the orchestrated mission:
 ```bash
 ros2 launch scenario_pkg scenario.launch.py
-```
-View camera topics:
-```bash
-ros2 run rqt_image_view rqt_image_view
 ```
 
 This brings up `scenario_runner`, which automatically:
@@ -56,6 +65,21 @@ This brings up `scenario_runner`, which automatically:
 - Hands off to `HRI.py` once the green beacon fills the camera view
 
 ## Useful commands and knobs
+
+View camera topics:
+```bash
+ros2 run rqt_image_view rqt_image_view
+```
+
+Copy audio prompts into the scenario manager feedback_voice directory:
+```bash
+cp /home/ubuntu/shared/warning.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/start_track_green.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/find_target.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/Danger.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/Survivor.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+```
+
 
 - Run the node directly (e.g., in a dev shell):
   ```bash
@@ -73,10 +97,7 @@ This brings up `scenario_runner`, which automatically:
   ```bash
   ros2 topic echo /camera/image_raw --no-arr
   ```
-- Rebuild after edits without rebuilding the whole workspace:
-  ```bash
-  colcon build --packages-select scenario_pkg --symlink-install
-  ```
+
 - Enable verbose debugging and pipe child stdout/stderr into the runner logs:
   ```bash
   ros2 run scenario_pkg scenario_runner --ros-args -p debug_mode:=true
@@ -104,18 +125,3 @@ This brings up `scenario_runner`, which automatically:
 
 The scenario is hands-free once launched; no manual color picking or stage toggling is required.
 
-## Audio prompts
-
-Copy audio prompts into the scenario manager feedback_voice directory:
-```bash
-cp /home/ubuntu/shared/warning.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
-cp /home/ubuntu/shared/start_track_green.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
-cp /home/ubuntu/shared/find_target.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
-```
-
-Copy HRI gesture audio prompts into the same feedback_voice directory:
-```bash
-cp /home/ubuntu/shared/Danger.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
-cp /home/ubuntu/shared/Survivor.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
-# add any other .wav cues you want HRI.py to play into the same folder
-```
