@@ -50,6 +50,16 @@ VOICE_FEEDBACK_DEFAULT = True  # global flag so voice can be toggled from one pl
 # -------------
 # Vision helper
 # -------------
+def _get_camera_type(default: str = "aurora") -> str:
+    """Fetch DEPTH_CAMERA_TYPE with a sane default so missing envs don't crash."""
+
+    camera_type = os.environ.get("DEPTH_CAMERA_TYPE") or os.environ.get("CAMERA_TYPE")
+    if not camera_type:
+        camera_type = default
+        os.environ["DEPTH_CAMERA_TYPE"] = camera_type
+    return camera_type
+
+
 def _load_lab_config():
     """Resolve LAB config from env override or user home; return empty dict on failure."""
     candidates = []
@@ -85,7 +95,8 @@ class LineFollower:
     def __call__(self, image, result_image, threshold, color):
         """Locate the largest green patch and report how far it sits from image center."""
         h, w = image.shape[:2]
-        if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
+        self.camera_type = _get_camera_type()
+        if self.camera_type == 'ascamera':
             w = w + 200
         lowerb = tuple(color['min'])
         upperb = tuple(color['max'])
@@ -122,10 +133,13 @@ class GreenLineFollowingNode(Node):
     window_lock_path = WINDOW_LOCK_PATH
 
     def __init__(self, name: str):
-        rclpy.init()
+        if not rclpy.ok():
+            rclpy.init()
         super().__init__(name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
 
-        # Identity and high-level state
+        # Identity and high-level state. Think of these flags as the simple
+        # story of the robot: what color we are chasing, whether we are paused,
+        # and how often we log what is happening.
         self.name = name
         self.color = DEFAULT_COLOR
         self.frame_count = 0
@@ -169,7 +183,7 @@ class GreenLineFollowingNode(Node):
         self.window_enabled = False
         self.window_lock_handle = None
         self.lab_data = _load_lab_config()
-        self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.camera_type = _get_camera_type()
         lab_map = self.lab_data.get('lab', {})
         self.lab_lookup_type = self.camera_type if self.camera_type in lab_map else 'ascamera'
         self.last_image_ts = None
@@ -378,7 +392,7 @@ class GreenLineFollowingNode(Node):
     def enter_srv_callback(self, request, response):
         """Start green navigation: reset PID, subscribe topics, and begin searching."""
         self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav enter")
-        if os.environ['DEPTH_CAMERA_TYPE'] != 'ascamera':
+        if self.camera_type != 'ascamera':
             self.pwm_controller([1850, 1500])
         with self.lock:
             self.stop = False

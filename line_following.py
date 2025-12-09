@@ -37,6 +37,16 @@ from servo_controller.bus_servo_control import set_servo_position
 MAX_SCAN_ANGLE = 240  # degree(the scanning angle of lidar. The covered part is always eliminated)
 
 
+def _get_camera_type(default: str = "aurora") -> str:
+    """Fetch DEPTH_CAMERA_TYPE with a sane default so missing envs don't crash."""
+
+    camera_type = os.environ.get("DEPTH_CAMERA_TYPE") or os.environ.get("CAMERA_TYPE")
+    if not camera_type:
+        camera_type = default
+        os.environ["DEPTH_CAMERA_TYPE"] = camera_type
+    return camera_type
+
+
 def _load_lab_config():
     """Resolve LAB config from env override or user home; return empty dict on failure."""
     candidates = []
@@ -57,7 +67,7 @@ class LineFollower:
     def __init__(self, color, node):
         self.node = node
         self.target_lab, self.target_rgb = color
-        self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.depth_camera_type = _get_camera_type()
         # Keep ROI selection in sync with scenario_runner via shared helper.
         self.rois = get_rois(self.depth_camera_type)
         self.weight_sum = sum(roi[-1] for roi in self.rois)
@@ -80,7 +90,7 @@ class LineFollower:
     def __call__(self, image, result_image, threshold, color=None, use_color_picker=True):
         centroid_sum = 0
         h, w = image.shape[:2]
-        if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
+        if self.depth_camera_type == 'ascamera':
             w = w + 200
         if use_color_picker:
             min_color = [int(self.target_lab[0] - 50 * threshold * 2),
@@ -156,7 +166,7 @@ class LineFollowingNode(Node):
         self.use_color_picker = True
         self.lab_data = _load_lab_config()
         self.image_queue = queue.Queue(2)
-        self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.camera_type = _get_camera_type()
         self.lidar_type = os.environ.get('LIDAR_TYPE')
         self.machine_type = os.environ.get('MACHINE_TYPE')
         self.pwm_pub = self.create_publisher(SetPWMServoState,'ros_robot_controller/pwm_servo/set_state',10)
@@ -226,7 +236,7 @@ class LineFollowingNode(Node):
 
     def enter_srv_callback(self, request, response):
         self.get_logger().info('\033[1;32m%s\033[0m' % "line following enter")
-        if os.environ['DEPTH_CAMERA_TYPE'] != 'ascamera':
+        if self.camera_type != 'ascamera':
             self.pwm_controller([1850,1500]) ## Pan / tilt originally [1850, 1500]
         with self.lock:
             self.stop = False

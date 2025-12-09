@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
 # encoding: utf-8
+"""Gesture-based safety/human-interaction helper.
+
+This node watches the camera feed for a closed fist (danger) or a wave/open
+palm (survivor/all-clear). When a gesture is confirmed it can stop the robot,
+play a short voice clip, and move the camera into a posture that fits the
+situation. Comments throughout the file use plain language to describe the
+flow.
+"""
+
 import cv2
 import time
 import rclpy
@@ -38,11 +47,17 @@ RING_FINGER_MCP = mp_hands.HandLandmark.RING_FINGER_MCP
 PINKY_MCP = mp_hands.HandLandmark.PINKY_MCP
 
 class FistStopNode(Node):
+    """ROS 2 node that turns hand gestures into simple robot actions."""
+
     def __init__(self, name):
-        rclpy.init()
+        # This node usually runs on its own, so we initialize rclpy here. If it
+        # is ever embedded in a larger app, have that app call ``rclpy.init``
+        # before constructing this node to avoid double-initialization errors.
+        if not rclpy.ok():
+            rclpy.init()
         super().__init__(name)
         self.name = name
-        
+
         # Audio Setup
         self.voice_base = self._resolve_voice_base()
         self.voice_enabled = bool(self.voice_base)
@@ -57,6 +72,9 @@ class FistStopNode(Node):
                                    "Set VOICE_FEEDBACK_PATH to a folder containing .wav files (e.g., Danger.wav, Survivor.wav).")
 
         # Hand Detector
+        # MediaPipe is used to spot hands and the individual finger joints. We
+        # keep the thresholds moderate so noisy video still registers gestures
+        # without requiring perfect lighting.
         self.hand_detector = mp.solutions.hands.Hands(
             static_image_mode=False,
             max_num_hands=1,
@@ -66,10 +84,14 @@ class FistStopNode(Node):
         self.drawing = mp.solutions.drawing_utils
         
         # Publishers
-        self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1) 
+        # These outputs let the node stop the drive base and reposition the arm
+        # servos when a gesture is confirmed.
+        self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1)
         self.joints_pub = self.create_publisher(ServosPosition, '/servo_controller', 1)
 
         # Camera Subscription
+        # Images are queued so the processing thread always sees the freshest
+        # frame without blocking the ROS callback.
         self.camera_topic = '/ascamera/camera_publisher/rgb0/image'
         self.bridge = CvBridge()
         self.image_queue = queue.Queue(maxsize=2)
@@ -77,14 +99,18 @@ class FistStopNode(Node):
         self.create_subscription(Image, self.camera_topic, self.image_callback, 1)
 
         # State Flags
+        # These booleans track what the latest video frame showed and whether
+        # the node should keep running.
         self.running = True
-        self.fist_detected = False 
+        self.fist_detected = False
         self.wave_detected = False # NEW: Flag for wave
-        self.check_attempts = 0 
+        self.check_attempts = 0
         self.fist_hold_start = None
         self.wave_hold_start = None
-        
+
         # Start Threads
+        # A lightweight pipeline: one thread converts images to gestures, the
+        # other decides what robot action to take.
         threading.Thread(target=self.image_proc, daemon=True).start()
         threading.Thread(target=self.control_loop, daemon=True).start()
         
@@ -115,7 +141,7 @@ class FistStopNode(Node):
         for path in candidates:
             if path and os.path.isdir(path):
                 return path
-        return candidates[0] if candidates else None
+        return None
 
     def _voice_path(self, name: str) -> str:
         base = self.voice_base
@@ -141,6 +167,7 @@ class FistStopNode(Node):
             self.get_logger().info(f"Available voice files: {', '.join(files)}")
 
     def _play_voice(self, name: str, volume: int = 100):
+        """Play a short wav file if voice is enabled and not on cooldown."""
         if not self.voice_enabled:
             return
         path = self._voice_path(name)
@@ -159,6 +186,7 @@ class FistStopNode(Node):
             self.get_logger().error(f"Voice playback failed for {name}: {e}")
 
     def image_callback(self, ros_image):
+        """Convert incoming ROS images to RGB frames and enqueue them."""
         try:
             cv_image = self.bridge.imgmsg_to_cv2(ros_image, "rgb8")
             rgb_image = np.array(cv_image, dtype=np.uint8)
@@ -216,6 +244,7 @@ class FistStopNode(Node):
         return extended_count >= 4
 
     def set_camera_posture(self, mode):
+        """Move the camera servos into sensible poses for each action."""
         # 10=Clamp, 5=Wrist, 4=Elbow, 3=Shoulder, 2=Tilt, 1=Pan
         if mode == 'drive':
             positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))
@@ -229,6 +258,7 @@ class FistStopNode(Node):
         time.sleep(0.5)
 
     def stop_robot(self):
+        """Send several zero-velocity commands to ensure the base stops."""
         twist = Twist()
         twist.linear.x = 0.0
         twist.angular.z = 0.0
@@ -237,10 +267,11 @@ class FistStopNode(Node):
             time.sleep(0.05)
 
     def move_forward(self):
+        """Creep forward slowly; used when approaching gestures."""
         twist = Twist()
-        twist.linear.x = 0.15 
+        twist.linear.x = 0.15
         self.mecanum_pub.publish(twist)
-    
+
     def rotate_once(self):
         """Timeout rotation: Left (Positive Z)"""
         self.get_logger().warn("Attempts limit reached. Rotating once (Left)...")
@@ -309,7 +340,8 @@ class FistStopNode(Node):
         return None
 
     def control_loop(self):
-        time.sleep(2) 
+        """High-level behavior that reacts to the latest gesture flags."""
+        time.sleep(2)
         
         while self.running:
             #if self.check_attempts >= 3:
@@ -370,6 +402,7 @@ class FistStopNode(Node):
         sys.exit(0)
 
     def image_proc(self):
+        """Continuously convert images into gesture flags for the control loop."""
         while self.running:
             try:
                 image = self.image_queue.get(block=True, timeout=1)
