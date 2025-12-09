@@ -27,6 +27,7 @@ from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
 from servo_controller_msgs.msg import ServosPosition
 from servo_controller.bus_servo_control import set_servo_position
+from scenario_pkg.common import resolve_camera_topic
 
 # --- IMPORTS FOR AUDIO ---
 from speech import speech
@@ -50,11 +51,6 @@ class FistStopNode(Node):
     """ROS 2 node that turns hand gestures into simple robot actions."""
 
     def __init__(self, name):
-        # This node usually runs on its own, so we initialize rclpy here. If it
-        # is ever embedded in a larger app, have that app call ``rclpy.init``
-        # before constructing this node to avoid double-initialization errors.
-        if not rclpy.ok():
-            rclpy.init()
         super().__init__(name)
         self.name = name
 
@@ -94,7 +90,8 @@ class FistStopNode(Node):
         # Camera Subscription
         # Images are queued so the processing thread always sees the freshest
         # frame without blocking the ROS callback.
-        self.camera_topic = '/ascamera/camera_publisher/rgb0/image'
+        camera_type = os.environ.get("DEPTH_CAMERA_TYPE") or os.environ.get("CAMERA_TYPE") or "aurora"
+        self.camera_topic = resolve_camera_topic(camera_type)
         self.bridge = CvBridge()
         self.image_queue = queue.Queue(maxsize=2)
         from sensor_msgs.msg import Image
@@ -466,6 +463,8 @@ class FistStopNode(Node):
                 self.running = False
 
 def main():
+    if not rclpy.ok():
+        rclpy.init()
     node = FistStopNode('fist_back_node')
     try:
         rclpy.spin(node)
@@ -475,6 +474,7 @@ def main():
         pass
     finally:
         node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == "__main__":
     main()

@@ -133,8 +133,6 @@ class GreenLineFollowingNode(Node):
     window_lock_path = WINDOW_LOCK_PATH
 
     def __init__(self, name: str):
-        if not rclpy.ok():
-            rclpy.init()
         super().__init__(name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
 
         # Identity and high-level state. Think of these flags as the simple
@@ -816,6 +814,8 @@ class GreenLineFollowingNode(Node):
 # -----------------------------
 def main():
     """Spin the ROS node until the user exits."""
+    if not rclpy.ok():
+        rclpy.init()
     node = GreenLineFollowingNode(PROGRAM_NAME)
     rclpy.spin(node)
     try:
