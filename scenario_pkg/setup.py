@@ -11,6 +11,8 @@ setup(
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
+        # Install the original scripts so the runner can invoke them from the installed share.
+        ('share/' + package_name, ['line_following.py', 'green_nav.py', 'HRI.py']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

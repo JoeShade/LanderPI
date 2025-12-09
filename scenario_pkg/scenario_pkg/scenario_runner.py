@@ -36,6 +36,7 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 import rclpy
+from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -54,7 +55,7 @@ BLACK_LAB_RANGE = {"min": [0, 0, 0], "max": [40, 120, 120]}
 GREEN_LAB_RANGE = {"min": [0, 80, 0], "max": [255, 120, 120]}  # broad green
 
 # How many frames without a line before we transition away from line following.
-LINE_LOST_FRAMES = 12
+LINE_LOST_FRAMES = 60
 
 # How large the green beacon should appear (fraction of the image area) before
 # handing control to HRI.
@@ -159,8 +160,13 @@ class ScenarioRunner(Node):
 
         # Camera helpers for transition sensing.
         self.bridge = CvBridge()
-        qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
-        self.image_sub = self.create_subscription(Image, "/camera/image_raw", self._image_cb, qos)
+        # Camera subscription (align with line_following/green_nav expectations).
+        self.camera_topic = "/ascamera/camera_publisher/rgb0/image"
+        qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        self.image_sub = self.create_subscription(Image, self.camera_topic, self._image_cb, qos)
+
+        # Resolve the installed share dir so we can launch the original scripts even from install space.
+        self.share_dir = Path(get_package_share_directory("scenario_pkg"))
 
         # Stage tracking.
         self.stage = Stage.LINE
@@ -197,9 +203,9 @@ class ScenarioRunner(Node):
         self._stop_child_process()
 
         script_map = {
-            Stage.LINE: os.path.join(os.path.dirname(__file__), "..", "..", "line_following.py"),
-            Stage.GREEN: os.path.join(os.path.dirname(__file__), "..", "..", "green_nav.py"),
-            Stage.HRI: os.path.join(os.path.dirname(__file__), "..", "..", "HRI.py"),
+            Stage.LINE: str(self.share_dir / "line_following.py"),
+            Stage.GREEN: str(self.share_dir / "green_nav.py"),
+            Stage.HRI: str(self.share_dir / "HRI.py"),
         }
 
         script = script_map[stage]
@@ -250,7 +256,11 @@ class ScenarioRunner(Node):
             self.get_logger().warning(f"Service {name} not available")
             return False
         future = client.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
+        done = threading.Event()
+        future.add_done_callback(lambda fut: done.set())
+        if not done.wait(timeout=8.0):
+            self.get_logger().warning(f"Service {name} timed out")
+            return False
         if future.exception() is not None:
             self.get_logger().warning(f"Service {name} failed: {future.exception()}")
             return False

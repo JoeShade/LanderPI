@@ -134,8 +134,25 @@ class LineFollowingNode(Node):
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         self.image_queue = queue.Queue(2)
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        # Select lab profile: prefer configured camera, else ascamera, else first available, else None.
+        lab_map = self.lab_data.get('lab', {})
+        if self.camera_type in lab_map:
+            self.lab_lookup_type = self.camera_type
+        elif 'ascamera' in lab_map:
+            self.lab_lookup_type = 'ascamera'
+        elif lab_map:
+            self.lab_lookup_type = next(iter(lab_map))
+        else:
+            self.lab_lookup_type = None
         self.lidar_type = os.environ.get('LIDAR_TYPE')
         self.machine_type = os.environ.get('MACHINE_TYPE')
+        self.missing_profile_logged = False
+        # Camera topic and frame counters for debugging visibility.
+        self.camera_topic = '/ascamera/camera_publisher/rgb0/image'
+        self.image_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        self.frame_count = 0
+        self.last_frame_time = None
+        self.debug_log_every_n = self.declare_parameter('debug_log_every_n', 30).value
         self.pwm_pub = self.create_publisher(SetPWMServoState,'ros_robot_controller/pwm_servo/set_state',10)
         self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1)  # (chassis control)
         self.result_publisher = self.create_publisher(Image, '~/image_result', 1)  # (publish the image processing result)
@@ -156,6 +173,10 @@ class LineFollowingNode(Node):
             threading.Thread(target=self.main, daemon=True).start()
         self.create_service(Trigger, '~/init_finish', self.get_node_state)
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
+        if self.debug:
+            self.get_logger().info(f"Debug enabled; subscribing to camera: {self.camera_topic}")
+            if self.lab_lookup_type and self.lab_lookup_type != self.camera_type:
+                self.get_logger().info(f"Using lab profile '{self.lab_lookup_type}' as fallback for color ranges")
         
     def pwm_controller(self,position_data):
         pwm_list = []
@@ -215,7 +236,9 @@ class LineFollowingNode(Node):
             #self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
             self.empty = 0
             if self.image_sub is None:
-                 self.image_sub = self.create_subscription(Image, '/camera/image_raw', self.image_callback, 1)  # 摄像头订阅(subscribe to the camera)
+                self.image_sub = self.create_subscription(Image, self.camera_topic, self.image_callback, qos_profile=self.image_qos)  # subscribe to the camera
+                if self.debug:
+                    self.get_logger().info("Subscribed to camera: %s" % self.camera_topic)
             if self.lidar_sub is None:
                 qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
                 self.lidar_sub = self.create_subscription(LaserScan, '/scan_raw', self.lidar_callback, qos)  # (subscribe to Lidar data)
@@ -297,6 +320,7 @@ class LineFollowingNode(Node):
         with self.lock:
             self.color = request.data
             self.use_color_picker = False
+            self.missing_profile_logged = False
         response.success = True
         response.message = "set_color"
         return response
@@ -342,6 +366,10 @@ class LineFollowingNode(Node):
         rgb_image = np.array(cv_image, dtype=np.uint8)
         self.image_height, self.image_width = rgb_image.shape[:2]
         result_image = np.copy(rgb_image)  #  (the image used to display the result)
+        self.frame_count += 1
+        self.last_frame_time = self.get_clock().now()
+        if self.debug and self.frame_count % max(1, int(self.debug_log_every_n)) == 0:
+            self.get_logger().info(f"[debug] frame {self.frame_count} size=({self.image_width}x{self.image_height}) from {self.camera_topic}")
         with self.lock:
             if self.use_color_picker:
                 # (color picker and line recognition are exclusive. If there is color picker, start picking)
@@ -378,10 +406,24 @@ class LineFollowingNode(Node):
                             self.get_logger().error(str(e))
             else:
                 twist = Twist()
-                if self.color in common.range_rgb:
-                    twist.linear.x = 0.05 # Speed control variable
+                lab_profiles = self.lab_data.get('lab', {})
+                color_profile = None
+                if (
+                    self.color in common.range_rgb
+                    and self.lab_lookup_type
+                    and self.lab_lookup_type in lab_profiles
+                ):
+                    color_profile = lab_profiles[self.lab_lookup_type].get(self.color)
+                if color_profile:
+                    twist.linear.x = 0.05  # Speed control variable
                     self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-                    result_image, deflection_angle = self.follower(rgb_image, result_image, self.threshold, self.lab_data['lab'][self.camera_type][self.color], False)
+                    result_image, deflection_angle = self.follower(
+                        rgb_image,
+                        result_image,
+                        self.threshold,
+                        color_profile,
+                        False,
+                    )
                     if deflection_angle is not None and self.is_running and not self.stop:
                         self.pid.update(deflection_angle)
                         if 'Acker' in self.machine_type:
@@ -397,6 +439,11 @@ class LineFollowingNode(Node):
                     else:
                         self.pid.clear()
                 else:
+                    if self.debug and not self.missing_profile_logged:
+                        self.get_logger().warning(
+                            f"Missing lab profile for camera '{self.camera_type}' (lookup '{self.lab_lookup_type}') color '{self.color}'"
+                        )
+                        self.missing_profile_logged = True
                     self.mecanum_pub.publish(twist)
         if self.debug:
             if self.image_queue.full():
@@ -404,8 +451,8 @@ class LineFollowingNode(Node):
                 self.image_queue.get()
                 # (put the image into the queue)
             self.image_queue.put(result_image)
-        else:
-            self.result_publisher.publish(self.bridge.cv2_to_imgmsg(result_image, "rgb8"))
+        # Always publish the processed image so tools like rqt_image_view can see it even when debug UI is on.
+        self.result_publisher.publish(self.bridge.cv2_to_imgmsg(result_image, "rgb8"))
 
 def main():
     node = LineFollowingNode('line_following')
@@ -415,5 +462,11 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
 
 
