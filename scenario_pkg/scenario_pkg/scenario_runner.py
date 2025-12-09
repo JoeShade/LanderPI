@@ -88,9 +88,12 @@ class LineWatcher:
     def __init__(self, rois: Tuple[Tuple[float, float, float, float, float], ...]):
         self.rois = rois
         self.weight_sum = sum(roi[-1] for roi in rois)
+        # Require more substantive detections so scattered carpet specks are ignored.
+        self.min_contour_area = 400
+        self.min_mask_ratio = 0.004  # fraction of ROI pixels that must be non-zero
 
     @staticmethod
-    def _largest_contour(contours, threshold=30):
+    def _largest_contour(contours, threshold=120):
         contour_area = zip(contours, tuple(map(lambda c: abs(cv2.contourArea(c)), contours)))
         contour_area = tuple(filter(lambda c_a: c_a[1] > threshold, contour_area))
         if contour_area:
@@ -106,10 +109,14 @@ class LineWatcher:
         for roi in self.rois:
             blob = image[int(roi[0] * h): int(roi[1] * h), int(roi[2] * w): int(roi[3] * w)]
             mask = cv2.inRange(cv2.cvtColor(blob, cv2.COLOR_RGB2LAB), lowerb, upperb)
+            # Skip ROIs where almost nothing is detected.
+            mask_ratio = float(cv2.countNonZero(mask)) / max(mask.size, 1)
+            if mask_ratio < self.min_mask_ratio:
+                continue
             eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
-            max_contour_area = self._largest_contour(contours)
+            max_contour_area = self._largest_contour(contours, self.min_contour_area)
             if max_contour_area is not None:
                 hit_count += 1
                 rect = cv2.minAreaRect(max_contour_area[0])
