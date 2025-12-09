@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>scenario_pkg</name>
+  <version>0.0.1</version>
+  <description>Scenario orchestrator combining line following, green beacon pursuit, and HRI gestures.</description>
+  <maintainer email="maintainer@example.com">Scenario Maintainer</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>cv_bridge</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>mediapipe</depend>
+  <depend>servo_controller_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
