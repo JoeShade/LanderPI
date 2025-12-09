@@ -57,5 +57,17 @@ This brings up `scenario_runner`, which automatically:
   ```bash
   colcon build --packages-select scenario_pkg --symlink-install
   ```
+- Enable verbose debugging and pipe child stdout/stderr into the runner logs:
+  ```bash
+  ros2 run scenario_pkg scenario_runner --ros-args -p debug_mode:=true
+  ```
+- Save transition snapshots for offline triage (images land in `/tmp/scenario_debug` by default):
+  ```bash
+  ros2 run scenario_pkg scenario_runner --ros-args -p save_debug_images:=true
+  ```
+- Query the runner status while it is live:
+  ```bash
+  ros2 service call /get_status std_srvs/srv/Trigger {}
+  ```
 
 The scenario is hands-free once launched; no manual color picking or stage toggling is required.

@@ -28,6 +28,8 @@ import signal
 import subprocess
 import sys
 import threading
+from datetime import datetime
+from pathlib import Path
 from enum import Enum
 from typing import Optional, Tuple
 
@@ -57,6 +59,10 @@ LINE_LOST_FRAMES = 12
 # How large the green beacon should appear (fraction of the image area) before
 # handing control to HRI.
 BEACON_AREA_THRESHOLD = 0.06
+
+# Debugging defaults.
+DEBUG_LOG_EVERY_N_FRAMES = 15
+DEBUG_OUTPUT_DIR = Path("/tmp/scenario_debug")
 
 # Region-of-interest stack matching the camera choices in line_following.py to
 # reuse its tuning. These percentages are (y_min, y_max, x_min, x_max, weight).
@@ -142,6 +148,15 @@ class ScenarioRunner(Node):
         rclpy.init()
         super().__init__("scenario_runner")
 
+        # Debug toggles can be adjusted via ROS parameters or the command line
+        # (e.g., ros2 run ... --ros-args -p debug_mode:=true -p save_debug_images:=true).
+        self.debug_mode: bool = self.declare_parameter("debug_mode", False).value
+        self.save_debug_images: bool = self.declare_parameter("save_debug_images", False).value
+        debug_dir_param = self.declare_parameter("debug_output_dir", str(DEBUG_OUTPUT_DIR)).value
+        self.debug_output_dir = Path(debug_dir_param)
+        self.debug_output_dir.mkdir(parents=True, exist_ok=True)
+        self.debug_log_every_n = max(1, int(self.declare_parameter("debug_log_every_n", DEBUG_LOG_EVERY_N_FRAMES).value))
+
         # Camera helpers for transition sensing.
         self.bridge = CvBridge()
         qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
@@ -151,6 +166,9 @@ class ScenarioRunner(Node):
         self.stage = Stage.LINE
         self.current_process: Optional[subprocess.Popen] = None
         self.line_lost_frames = 0
+        self.frame_counter = 0
+        self.last_image: Optional[np.ndarray] = None
+        self.child_log_threads: Tuple[threading.Thread, ...] = tuple()
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "aurora")
         self.line_watcher = LineWatcher(ROI_TABLE.get(camera_type, ROI_TABLE["aurora"]))
         self.green_watcher = GreenWatcher()
@@ -160,6 +178,9 @@ class ScenarioRunner(Node):
         self.black_upper = tuple(BLACK_LAB_RANGE["max"])
         self.green_lower = tuple(GREEN_LAB_RANGE["min"])
         self.green_upper = tuple(GREEN_LAB_RANGE["max"])
+
+        # Allow external introspection when diagnosing issues.
+        self.create_service(Trigger, "get_status", self._handle_get_status)
 
         # Start the first stage immediately.
         self._launch_stage(Stage.LINE)
@@ -173,14 +194,7 @@ class ScenarioRunner(Node):
     def _launch_stage(self, stage: Stage):
         """Start the requested stage's original script as a subprocess."""
 
-        if self.current_process and self.current_process.poll() is None:
-            self.get_logger().info("Stopping previous stage before launching %s" % stage.name)
-            self.current_process.terminate()
-            try:
-                self.current_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self.get_logger().warning("Force-killing previous stage")
-                self.current_process.kill()
+        self._stop_child_process()
 
         script_map = {
             Stage.LINE: os.path.join(os.path.dirname(__file__), "..", "..", "line_following.py"),
@@ -197,16 +211,36 @@ class ScenarioRunner(Node):
         # Ensure the line follower starts without user color picking.
         env.setdefault("LINE_USE_DEFAULT", "1")
 
+        stdout_pipe = subprocess.PIPE if self.debug_mode else None
+        stderr_pipe = subprocess.PIPE if self.debug_mode else None
         # Use unbuffered output so logs stream to ros2 log.
-        self.current_process = subprocess.Popen([sys.executable, "-u", script], env=env)
+        self.current_process = subprocess.Popen(
+            [sys.executable, "-u", script], env=env, stdout=stdout_pipe, stderr=stderr_pipe, text=True, bufsize=1
+        )
         self.stage = stage
         self.line_lost_frames = 0
+        self.frame_counter = 0
+        self._attach_child_loggers()
 
         # Configure the node after a short delay to let services come up.
         if stage == Stage.LINE:
             threading.Thread(target=self._configure_line_node, daemon=True).start()
         elif stage == Stage.GREEN:
             threading.Thread(target=self._configure_green_node, daemon=True).start()
+
+        if self.save_debug_images:
+            self._save_debug_image(self.last_image, f"launch_{stage.name.lower()}")
+
+    def _stop_child_process(self):
+        if self.current_process and self.current_process.poll() is None:
+            self.get_logger().info("Stopping previous stage before launching new one")
+            self.current_process.terminate()
+            try:
+                self.current_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.get_logger().warning("Force-killing previous stage")
+                self.current_process.kill()
+        self._join_child_loggers()
 
     def _call_service(self, srv_type, name: str, request):
         """Utility to synchronously call a service with retry."""
@@ -221,6 +255,30 @@ class ScenarioRunner(Node):
             self.get_logger().warning(f"Service {name} failed: {future.exception()}")
             return False
         return getattr(future.result(), "success", True)
+
+    def _attach_child_loggers(self):
+        if not self.debug_mode or not self.current_process:
+            return
+        threads = []
+        if self.current_process.stdout:
+            threads.append(threading.Thread(target=self._pipe_logger, args=(self.current_process.stdout, "stdout"), daemon=True))
+        if self.current_process.stderr:
+            threads.append(threading.Thread(target=self._pipe_logger, args=(self.current_process.stderr, "stderr"), daemon=True))
+        for t in threads:
+            t.start()
+        self.child_log_threads = tuple(threads)
+
+    def _pipe_logger(self, pipe, label: str):
+        for line in iter(pipe.readline, ""):
+            clean = line.rstrip() if line else ""
+            if clean:
+                self.get_logger().info(f"[{self.stage.name} {label}] {clean}")
+        pipe.close()
+
+    def _join_child_loggers(self):
+        for t in self.child_log_threads:
+            t.join(timeout=0.5)
+        self.child_log_threads = tuple()
 
     def _configure_line_node(self):
         """Set the color to black and start the line follower."""
@@ -239,6 +297,15 @@ class ScenarioRunner(Node):
         base_name = "/green_nav"
         self._call_service(Trigger, f"{base_name}/enter", Trigger.Request())
 
+    def _handle_get_status(self, request, response):  # noqa: ARG002
+        running = self.current_process and self.current_process.poll() is None
+        response.success = True
+        response.message = (
+            f"stage={self.stage.name}, child_running={running}, "
+            f"line_lost_frames={self.line_lost_frames}, frame_counter={self.frame_counter}"
+        )
+        return response
+
     # ------------------------------------------------------------------
     # Image callbacks used purely for transition decisions
     # ------------------------------------------------------------------
@@ -249,6 +316,8 @@ class ScenarioRunner(Node):
             self.get_logger().warning(f"Failed to decode image: {exc}")
             return
 
+        self.last_image = image
+        self.frame_counter += 1
         if self.stage == Stage.LINE:
             self._handle_line_stage(image)
         elif self.stage == Stage.GREEN:
@@ -261,16 +330,28 @@ class ScenarioRunner(Node):
         else:
             self.line_lost_frames = 0
 
+        if self.debug_mode and self.frame_counter % self.debug_log_every_n == 0:
+            self.get_logger().info(
+                f"[LINE debug] frame={self.frame_counter}, angle={angle if angle is not None else 'none'}, "
+                f"lost_frames={self.line_lost_frames}"
+            )
+
         if self.line_lost_frames >= LINE_LOST_FRAMES:
             self.get_logger().info("Line lost for %d frames, switching to GREEN stage" % self.line_lost_frames)
+            if self.save_debug_images:
+                self._save_debug_image(image, "line_lost")
             self._launch_stage(Stage.GREEN)
 
     def _handle_green_stage(self, image: np.ndarray):
         area_ratio = self.green_watcher.area_ratio(image, self.green_lower, self.green_upper)
+        if self.debug_mode and self.frame_counter % self.debug_log_every_n == 0:
+            self.get_logger().info(f"[GREEN debug] frame={self.frame_counter}, beacon_area={area_ratio:.4f}")
         if area_ratio >= BEACON_AREA_THRESHOLD:
             self.get_logger().info(
                 f"Beacon reached (area ratio {area_ratio:.3f} >= {BEACON_AREA_THRESHOLD}), switching to HRI"
             )
+            if self.save_debug_images:
+                self._save_debug_image(image, "beacon_reached")
             self._launch_stage(Stage.HRI)
 
     # ------------------------------------------------------------------
@@ -280,6 +361,17 @@ class ScenarioRunner(Node):
         running = self.current_process and self.current_process.poll() is None
         self.get_logger().info(f"Stage={self.stage.name}, child_running={running}, lost_frames={self.line_lost_frames}")
 
+    def _save_debug_image(self, image: Optional[np.ndarray], label: str):
+        if image is None:
+            return
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        filename = self.debug_output_dir / f"{timestamp}_{label}.png"
+        try:
+            cv2.imwrite(str(filename), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            self.get_logger().info(f"Saved debug frame to {filename}")
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warning(f"Failed to save debug frame {filename}: {exc}")
+
     def destroy_node(self):
         if self.current_process and self.current_process.poll() is None:
             self.get_logger().info("Terminating active child before shutdown")
@@ -288,6 +380,7 @@ class ScenarioRunner(Node):
                 self.current_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.current_process.kill()
+        self._join_child_loggers()
         super().destroy_node()
 
 
