@@ -25,6 +25,7 @@ from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import Image, LaserScan
+from speech import speech
 
 import sdk.common as common
 import sdk.pid as pid
@@ -47,6 +48,7 @@ LIDAR_STOP_DISTANCE = 0.25  # meters before we perform an immediate stop
 LIDAR_AVOID_DISTANCE = 0.45  # meters when we start biasing away from obstacles
 LIDAR_BIAS_GAIN = 0.8  # scale for converting lidar difference into angular velocity
 VOICE_COOLDOWN = 8.0  # seconds between voice prompts in HRI stage
+VOICE_VOLUME = 90  # playback volume used across stages
 
 
 class MissionStage(Enum):
@@ -194,11 +196,11 @@ class ScenarioNode(Node):
         # Helpers
         self.line_pid = pid.PID(0.030, 0.003, 0.0)
         self.beacon_pid = pid.PID(0.020, 0.003, 0.0)
-        self.line_detector = SimpleLineDetector(((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1)))
+        self.line_detector = SimpleLineDetector(self._roi_for_camera())
         self.green_detector = GreenBeaconDetector()
         self.gesture_classifier = GestureClassifier()
 
-        # Calibration data
+        # Calibration data and voice prompts
         lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
         lab = lab_data.get("lab", {})
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "ascamera")
@@ -207,6 +209,10 @@ class ScenarioNode(Node):
         if self.line_color == DEFAULT_BLACK_LAB:
             self.get_logger().info("Using built-in black line profile; no picking required.")
         self.green_color = lab.get(lookup_type, {}).get(GREEN_COLOR_KEY, {"min": [0, 0, 0], "max": [255, 255, 255]})
+        self.voice_base = os.environ.get("VOICE_FEEDBACK_PATH") or os.path.join(os.path.dirname(__file__), "feedback_voice")
+        os.environ.setdefault("VOICE_FEEDBACK_PATH", self.voice_base)
+        self.voice_enabled = True
+        self.last_voice_played = {}
 
         # State bookkeeping
         self.lidar_ranges: Optional[np.ndarray] = None
@@ -221,6 +227,14 @@ class ScenarioNode(Node):
     # ------------------
     # Topic resolvers
     # ------------------
+    def _roi_for_camera(self):
+        camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "ascamera")
+        if camera_type == "aurora":
+            return ((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1))
+        if camera_type == "usb_cam":
+            return ((0.79, 0.81, 0, 1, 0.7), (0.67, 0.69, 0, 1, 0.2), (0.55, 0.57, 0, 1, 0.1))
+        return ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1))
+
     def _resolve_image_topic(self) -> str:
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "ascamera")
         topic_map = {
@@ -276,6 +290,7 @@ class ScenarioNode(Node):
             self.get_logger().debug("Line missing; incrementing lost frame count.")
             if self.lost_line_frames >= LINE_SEARCH_LOST_FRAMES:
                 self._transition_to_green_nav(reason="Line lost")
+                self._play_voice("start_track_green")
             self._publish_twist(0.0, 0.0)
             return
         self.lost_line_frames = 0
@@ -292,6 +307,7 @@ class ScenarioNode(Node):
         avoidance_bias = self._compute_avoidance_bias()
         if area_ratio >= BEACON_FOUND_AREA_RATIO:
             self.get_logger().info("Green beacon reached; entering HRI mode.")
+            self._play_voice("success")
             self._publish_twist(0.0, 0.0)
             self.stage = MissionStage.HRI
             return
@@ -312,12 +328,20 @@ class ScenarioNode(Node):
         if gesture and (now - self.last_voice_ts) > VOICE_COOLDOWN:
             self.get_logger().info(f"Gesture detected: {gesture}")
             self.last_voice_ts = now
+            if gesture == "wave":
+                self._play_voice("find_target")
+            elif gesture == "fist":
+                self._play_voice("warning")
         if gesture == "wave":
             self._publish_twist(0.15, 0.0)
             self._set_head_pose("look_up")
+            self._schedule_spin(direction=-1)
         elif gesture == "fist":
             self._publish_twist(0.0, 0.0)
             self._set_head_pose("drive")
+            self._schedule_spin(direction=1)
+
+        self._execute_scheduled_spin()
 
     # ------------------
     # Helpers
@@ -351,9 +375,46 @@ class ScenarioNode(Node):
             positions = ((10, 200), (5, 500), (4, 90), (3, 350), (2, 780), (1, 500))
         set_servo_position(self.joints_pub, 1.0, positions)
 
+    def _play_voice(self, name: str):
+        if not self.voice_enabled:
+            return
+        filename = name if os.path.splitext(name)[1] else name + ".wav"
+        candidate = filename if os.path.isabs(filename) else os.path.join(self.voice_base, filename)
+        now = time.time()
+        last = self.last_voice_played.get(candidate)
+        if last is not None and (now - last) < VOICE_COOLDOWN:
+            return
+        if not os.path.exists(candidate):
+            self.get_logger().debug(f"Voice file missing: {candidate}")
+            return
+        try:
+            speech.set_volume(VOICE_VOLUME)
+            speech.play_audio(candidate)
+            self.last_voice_played[candidate] = now
+        except Exception as exc:
+            self.get_logger().warn(f"Voice playback failed for {candidate}: {exc}")
+
+    def _schedule_spin(self, direction: int):
+        # Mirror the celebratory/alert spins from HRI.py when gestures are seen.
+        angular_rate = 1.5 * direction
+        duration = math.pi / max(abs(angular_rate), 1e-3)
+        self._spin_until = time.time() + duration
+        self._spin_rate = angular_rate
+
+    def _execute_scheduled_spin(self):
+        end_time = getattr(self, "_spin_until", None)
+        if end_time is None:
+            return
+        if time.time() >= end_time:
+            self._spin_until = None
+            self._publish_twist(0.0, 0.0)
+            return
+        self._publish_twist(0.0, getattr(self, "_spin_rate", 0.0))
+
     def _transition_to_green_nav(self, reason: str):
         self.get_logger().info(f"Transitioning to green beacon search: {reason}")
         self.stage = MissionStage.GREEN_NAV
+        self._set_head_pose("look_up")
         self._publish_twist(0.0, 0.0)
 
     def _heartbeat(self):
