@@ -59,6 +59,7 @@ class LineFollower:
         h, w = image.shape[:2]
         if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
             w = w + 200
+        hit_count = 0
         if use_color_picker:
             min_color = [int(self.target_lab[0] - 50 * threshold * 2),
                          int(self.target_lab[1] - 50 * threshold),
@@ -84,6 +85,7 @@ class LineFollower:
             contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]  # (find the contour)
             max_contour_area = self.get_area_max_contour(contours, 30)  # (get the contour corresponding to the largest contour)
             if max_contour_area is not None:
+                hit_count += 1
                 rect = cv2.minAreaRect(max_contour_area[0])  # (minimum circumscribed rectangle)
                 box = np.intp(cv2.boxPoints(rect))  # (four corners)
                 for j in range(4):
@@ -98,11 +100,12 @@ class LineFollower:
 
                 cv2.circle(result_image, (int(line_center_x), int(line_center_y)), 5, (0, 0, 255), -1)   # (draw the center point)
                 centroid_sum += line_center_x * roi[-1]
-        if centroid_sum == 0:
-            return result_image, None
+        # Require at least two ROI hits to consider the line valid; otherwise treat as no detection.
+        if centroid_sum == 0 or hit_count < 2:
+            return result_image, None, hit_count
         center_pos = centroid_sum / self.weight_sum  # (calculate the center point according to the ratio)
         deflection_angle = -math.atan((center_pos - (w / 2.0)) / (h / 2.0))   # (calculate the line angle)
-        return result_image, deflection_angle
+        return result_image, deflection_angle, hit_count
 
 class LineFollowingNode(Node):
     def __init__(self, name):
@@ -124,6 +127,7 @@ class LineFollowingNode(Node):
         self.stop = False
         self.threshold = 0.5
         self.stop_threshold = 0.4
+        self.scatter_block = False
         self.lock = threading.RLock()
         self.image_sub = None
         self.lidar_sub = None
@@ -164,6 +168,7 @@ class LineFollowingNode(Node):
         self.create_service(Trigger, '~/get_target_color', self.get_target_color_srv_callback)   # (get the color)
         self.create_service(SetFloat64, '~/set_threshold', self.set_threshold_srv_callback)  # (set the threshold)
         self.joints_pub = self.create_publisher(ServosPosition, 'servo_controller', 1)
+        self._last_stop_state = False  # track lidar stop toggles for debug
 
         Heart(self, self.name + '/heartbeat', 5, lambda _: self.exit_srv_callback(request=Trigger.Request(), response=Trigger.Response()))  # (heartbeat package)
         # Default debug to True so the UI window opens when not set via parameters
@@ -171,6 +176,8 @@ class LineFollowingNode(Node):
         self.debug = self.get_parameter('debug').value
         if self.debug: 
             threading.Thread(target=self.main, daemon=True).start()
+        else:
+            self.get_logger().info("Debug UI disabled (no color picker window). Set param 'debug' true to enable.")
         self.create_service(Trigger, '~/init_finish', self.get_node_state)
         self.get_logger().info('\033[1;32m%s\033[0m' % 'start')
         if self.debug:
@@ -195,6 +202,11 @@ class LineFollowingNode(Node):
         return response
 
     def main(self):
+        try:
+            cv2.namedWindow("result", cv2.WINDOW_NORMAL)
+        except Exception as exc:
+            self.get_logger().warning(f"Failed to create debug window: {exc}")
+            return
         while True:
             try:
                 image = self.image_queue.get(block=True, timeout=1)
@@ -228,7 +240,7 @@ class LineFollowingNode(Node):
             self.pwm_controller([1850,1500]) ## Pan / tilt originally [1850, 1500]
         with self.lock:
             self.stop = False
-            self.is_running = False
+            self.is_running = False  # will be re-enabled after color is chosen
             self.color_picker = None
             self.pid = pid.PID(1.1, 0.0, 0.0)
             self.follower = None
@@ -276,6 +288,8 @@ class LineFollowingNode(Node):
             self.use_color_picker = True
             x, y = request.data.x, request.data.y
             self.follower = None
+            # Enable motion once a target is selected.
+            self.is_running = True
             if x == -1 and y == -1:
                 self.color_picker = None
             else:
@@ -321,6 +335,8 @@ class LineFollowingNode(Node):
             self.color = request.data
             self.use_color_picker = False
             self.missing_profile_logged = False
+            # Enable motion when a color is explicitly set.
+            self.is_running = True
         response.success = True
         response.message = "set_color"
         return response
@@ -360,6 +376,11 @@ class LineFollowingNode(Node):
                 if self.count > 5:
                     self.count = 0
                     self.stop = False
+        # Emit a debug log when stop state toggles so we know if lidar is blocking motion.
+        if self.debug and self.stop != self._last_stop_state:
+            state = "STOPPED" if self.stop else "CLEAR"
+            self.get_logger().info(f"[lidar] stop={state}, min_left={min_dist_left_[:1] if len(min_dist_left_)>0 else 'n/a'}, min_right={min_dist_right_[:1] if len(min_dist_right_)>0 else 'n/a'}")
+        self._last_stop_state = self.stop
 
     def image_callback(self, ros_image):
         cv_image = self.bridge.imgmsg_to_cv2(ros_image, "rgb8")
@@ -387,8 +408,11 @@ class LineFollowingNode(Node):
                     twist.linear.x = 0.05 # Speed control variable
                     if self.follower is not None:
                         try:
-                            result_image, deflection_angle = self.follower(rgb_image, result_image, self.threshold)
-                            if deflection_angle is not None and self.is_running and not self.stop:
+                            result_image, deflection_angle, hit_count = self.follower(rgb_image, result_image, self.threshold)
+                            # Do not block motion on scatter anymore; only lidar stop will block.
+                            self.scatter_block = False
+                            effective_stop = self.stop
+                            if deflection_angle is not None and self.is_running and not effective_stop:
                                 self.pid.update(deflection_angle)
                                 if 'Acker' in self.machine_type:
                                     steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
@@ -398,10 +422,21 @@ class LineFollowingNode(Node):
                                 else:
                                     twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
                                 self.mecanum_pub.publish(twist)
-                            elif self.stop:
+                                if self.debug and self.frame_count % max(1, int(self.debug_log_every_n)) == 0:
+                                    self.get_logger().info(
+                                        f"[motion] angle={deflection_angle:.4f}, lin_x={twist.linear.x:.3f}, ang_z={twist.angular.z:.3f}, stop={effective_stop}, hits={hit_count}"
+                                    )
+                            elif effective_stop:
+                                if self.debug:
+                                    reason = "lidar" if self.stop else "no_roi"
+                                    self.get_logger().debug(f"Motion suppressed: stop flag set ({reason}), hits={hit_count}")
                                 self.mecanum_pub.publish(Twist())
                             else:
                                 self.pid.clear()
+                                if self.debug:
+                                    self.get_logger().debug(
+                                        f"Suppressing motion (angle={deflection_angle}, hits={hit_count}, is_running={self.is_running}, stop={effective_stop})"
+                                    )
                         except Exception as e:
                             self.get_logger().error(str(e))
             else:
@@ -417,14 +452,17 @@ class LineFollowingNode(Node):
                 if color_profile:
                     twist.linear.x = 0.05  # Speed control variable
                     self.follower = LineFollower([None, common.range_rgb[self.color]], self)
-                    result_image, deflection_angle = self.follower(
+                    result_image, deflection_angle, hit_count = self.follower(
                         rgb_image,
                         result_image,
                         self.threshold,
                         color_profile,
                         False,
                     )
-                    if deflection_angle is not None and self.is_running and not self.stop:
+                    # Do not block motion on scatter anymore; only lidar stop will block.
+                    self.scatter_block = False
+                    effective_stop = self.stop
+                    if deflection_angle is not None and self.is_running and not effective_stop:
                         self.pid.update(deflection_angle)
                         if 'Acker' in self.machine_type:
                             steering_angle = common.set_range(-self.pid.output, -math.radians(40), math.radians(40))
@@ -434,10 +472,20 @@ class LineFollowingNode(Node):
                         else:
                             twist.angular.z = common.set_range(-self.pid.output, -1.0, 1.0)
                         self.mecanum_pub.publish(twist)
+                        if self.debug and self.frame_count % max(1, int(self.debug_log_every_n)) == 0:
+                            self.get_logger().info(
+                                f"[motion] angle={deflection_angle:.4f}, lin_x={twist.linear.x:.3f}, ang_z={twist.angular.z:.3f}, stop={effective_stop}, hits={hit_count}"
+                            )
                     elif self.stop:
+                        if self.debug:
+                            self.get_logger().debug("Motion suppressed: stop flag set")
                         self.mecanum_pub.publish(Twist())
                     else:
                         self.pid.clear()
+                        if self.debug:
+                            self.get_logger().debug(
+                                f"Suppressing motion (angle={deflection_angle}, hits={hit_count}, is_running={self.is_running}, stop={effective_stop})"
+                            )
                 else:
                     if self.debug and not self.missing_profile_logged:
                         self.get_logger().warning(

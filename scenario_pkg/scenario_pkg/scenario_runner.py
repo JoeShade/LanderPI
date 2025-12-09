@@ -55,7 +55,7 @@ BLACK_LAB_RANGE = {"min": [0, 0, 0], "max": [40, 120, 120]}
 GREEN_LAB_RANGE = {"min": [0, 80, 0], "max": [255, 120, 120]}  # broad green
 
 # How many frames without a line before we transition away from line following.
-LINE_LOST_FRAMES = 60
+LINE_LOST_FRAMES = 10
 
 # How large the green beacon should appear (fraction of the image area) before
 # handing control to HRI.
@@ -97,11 +97,12 @@ class LineWatcher:
             return max(contour_area, key=lambda c_a: c_a[1])
         return None
 
-    def detect_angle(self, image: np.ndarray, lowerb, upperb) -> Optional[float]:
-        """Return the steering angle if a line is found, None otherwise."""
+    def detect_angle(self, image: np.ndarray, lowerb, upperb) -> Tuple[Optional[float], int]:
+        """Return (steering angle, hit_count). Angle is None if too few ROI hits."""
 
         h, w = image.shape[:2]
         centroid_sum = 0.0
+        hit_count = 0
         for roi in self.rois:
             blob = image[int(roi[0] * h): int(roi[1] * h), int(roi[2] * w): int(roi[3] * w)]
             mask = cv2.inRange(cv2.cvtColor(blob, cv2.COLOR_RGB2LAB), lowerb, upperb)
@@ -110,6 +111,7 @@ class LineWatcher:
             contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
             max_contour_area = self._largest_contour(contours)
             if max_contour_area is not None:
+                hit_count += 1
                 rect = cv2.minAreaRect(max_contour_area[0])
                 box = np.intp(cv2.boxPoints(rect))
                 center_x = (box[0, 0] + box[2, 0]) / 2
@@ -117,11 +119,11 @@ class LineWatcher:
                 cv2.circle(blob, (int(center_x), int(center_y)), 3, (255, 0, 0), -1)
                 centroid_sum += center_x * roi[-1]
 
-        if centroid_sum == 0:
-            return None
+        if centroid_sum == 0 or hit_count < 2:
+            return None, hit_count
         center_pos = centroid_sum / max(self.weight_sum, 1e-6)
         deflection_angle = -math.atan((center_pos - (w / 2.0)) / (h / 2.0))
-        return deflection_angle
+        return deflection_angle, hit_count
 
 
 class GreenWatcher:
@@ -172,6 +174,7 @@ class ScenarioRunner(Node):
         self.stage = Stage.LINE
         self.current_process: Optional[subprocess.Popen] = None
         self.line_lost_frames = 0
+        self.line_transition_armed = False
         self.frame_counter = 0
         self.last_image: Optional[np.ndarray] = None
         self.child_log_threads: Tuple[threading.Thread, ...] = tuple()
@@ -296,7 +299,6 @@ class ScenarioRunner(Node):
         # Wait briefly so the child can advertise services.
         self.get_clock().sleep_for(Duration(seconds=1))
         base_name = "/line_following"
-        self._call_service(SetString, f"{base_name}/set_color", SetString.Request(data="black"))
         self._call_service(SetBool, f"{base_name}/set_running", SetBool.Request(data=True))
         self._call_service(Trigger, f"{base_name}/enter", Trigger.Request())
 
@@ -334,19 +336,21 @@ class ScenarioRunner(Node):
             self._handle_green_stage(image)
 
     def _handle_line_stage(self, image: np.ndarray):
-        angle = self.line_watcher.detect_angle(image, self.black_lower, self.black_upper)
-        if angle is None:
-            self.line_lost_frames += 1
-        else:
+        angle, hits = self.line_watcher.detect_angle(image, self.black_lower, self.black_upper)
+        if angle is not None:
+            # Arm the transition logic only after we have seen a valid line once.
+            self.line_transition_armed = True
             self.line_lost_frames = 0
+        elif self.line_transition_armed:
+            self.line_lost_frames += 1
 
         if self.debug_mode and self.frame_counter % self.debug_log_every_n == 0:
             self.get_logger().info(
                 f"[LINE debug] frame={self.frame_counter}, angle={angle if angle is not None else 'none'}, "
-                f"lost_frames={self.line_lost_frames}"
+                f"hits={hits}, lost_frames={self.line_lost_frames}"
             )
 
-        if self.line_lost_frames >= LINE_LOST_FRAMES:
+        if self.line_transition_armed and self.line_lost_frames >= LINE_LOST_FRAMES:
             self.get_logger().info("Line lost for %d frames, switching to GREEN stage" % self.line_lost_frames)
             if self.save_debug_images:
                 self._save_debug_image(image, "line_lost")
