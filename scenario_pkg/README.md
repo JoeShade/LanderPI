@@ -69,5 +69,11 @@ This brings up `scenario_runner`, which automatically:
   ```bash
   ros2 service call /get_status std_srvs/srv/Trigger {}
   ```
+- Stall watchdog (new): the runner now monitors `/odom` to detect when motion commands are being published but the robot is not actually moving, and will advance LINE→GREEN or GREEN→HRI after the timeout (default 3s). Tweak via parameters:
+  ```bash
+  ros2 run scenario_pkg scenario_runner --ros-args -p motion_timeout:=3.0 -p motion_check_period:=0.5
+  ```
+  Make sure `/odom` is available; otherwise reduce the timeout or disable if testing in a headless environment.
+- Thread safety (green_nav): service callbacks and image/lidar callbacks are now guarded by a re-entrant lock to avoid races on `is_running`, `stop`, and related flags. No behavior change expected, just safer concurrent handling.
 
 The scenario is hands-free once launched; no manual color picking or stage toggling is required.

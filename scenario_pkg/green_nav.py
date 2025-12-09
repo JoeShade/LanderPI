@@ -174,7 +174,8 @@ class GreenLineFollowingNode(Node):
         self.threshold = DEFAULT_THRESHOLD  # wider default tolerance for green
         self.stop_threshold = float(self.declare_parameter('stop_threshold', DEFAULT_STOP_THRESHOLD).value)
         self.turn_scale = float(self.declare_parameter('turn_scale', DEFAULT_TURN_SCALE).value)
-        self.lock = threading.RLock()
+        # Protect shared state touched by services and sensor callbacks.
+        self.state_lock = threading.RLock()
         self.image_sub = None
         self.lidar_sub = None
         self.bridge = CvBridge()
@@ -368,7 +369,7 @@ class GreenLineFollowingNode(Node):
     def _search_status_tick(self):
         if not self.debug:
             return
-        with self.lock:
+        with self.state_lock:
             if self.is_running and self.searching_for_green and not self.stop:
                 # Reminder while the robot spins to reacquire the beacon.
                 self.log_debug(f"Searching for green target; angular z={self.search_angular_speed}")
@@ -394,7 +395,7 @@ class GreenLineFollowingNode(Node):
         self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav enter")
         if self.camera_type != 'ascamera':
             self.pwm_controller([1850, 1500])
-        with self.lock:
+        with self.state_lock:
             self.stop = False
             self.is_running = True  # Start navigation immediately on enter; no separate set_running needed.
             self.searching_for_green = True
@@ -418,17 +419,17 @@ class GreenLineFollowingNode(Node):
     def exit_srv_callback(self, request, response):
         """Stop navigation and tear down subscriptions so the robot holds still."""
         self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav exit")
-        try:
-            if self.image_sub is not None:
-                self.destroy_subscription(self.image_sub)
-                self.image_sub = None
-            if self.lidar_sub is not None:
-                self.destroy_subscription(self.lidar_sub)
-                self.lidar_sub = None
-            self.log_debug("Exit: subscriptions destroyed and robot stopped.")
-        except Exception as e:
-            self.get_logger().error(str(e))
-        with self.lock:
+        with self.state_lock:
+            try:
+                if self.image_sub is not None:
+                    self.destroy_subscription(self.image_sub)
+                    self.image_sub = None
+                if self.lidar_sub is not None:
+                    self.destroy_subscription(self.lidar_sub)
+                    self.lidar_sub = None
+                self.log_debug("Exit: subscriptions destroyed and robot stopped.")
+            except Exception as e:
+                self.get_logger().error(str(e))
             self.is_running = False
             self.pid = pid.PID(0.00, 0.001, 0.0)
             self.follower = LineFollower([None, common.range_rgb[self.color]], self)
@@ -442,7 +443,7 @@ class GreenLineFollowingNode(Node):
         """Legacy toggle; prefer the enter/exit pair but keep this for compatibility."""
         # Deprecated: enter now starts navigation; this remains for compatibility.
         self.get_logger().info('\033[1;32m%s\033[0m' % "set_running (deprecated)")
-        with self.lock:
+        with self.state_lock:
             self.is_running = request.data
             if self.is_running:
                 self.searching_for_green = True
@@ -456,7 +457,7 @@ class GreenLineFollowingNode(Node):
     def set_threshold_srv_callback(self, request, response):
         """Adjust LAB detection tolerance at runtime; higher values accept more green."""
         self.get_logger().info('\033[1;32m%s\033[0m' % "set threshold")
-        with self.lock:
+        with self.state_lock:
             self.threshold = request.data
             self.log_debug(f"Threshold updated: {self.threshold}")
             response.success = True
@@ -468,7 +469,7 @@ class GreenLineFollowingNode(Node):
     # -----------------------------
     def lidar_callback(self, lidar_data):
         """Use the lidar scan to bias steering away from nearby obstacles."""
-        with self.lock:
+        with self.state_lock:
             # Focus on the forward arc and steer toward whichever side has more room.
             previous_turning_in_place = self.avoidance_turn_in_place
             avoidance_already_active = self.avoidance_in_progress
@@ -593,7 +594,7 @@ class GreenLineFollowingNode(Node):
         rgb_image = np.array(cv_image, dtype=np.uint8)
         result_image = np.copy(rgb_image)
         self.last_image_ts = time.time()
-        with self.lock:
+        with self.state_lock:
             twist = Twist()
             now = time.time()
             if self.follower is None:

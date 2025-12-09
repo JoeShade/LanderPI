@@ -40,6 +40,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
@@ -211,7 +212,10 @@ class ScenarioRunner(Node):
         self.shutdown_requested = False
         # Stall timer arms only after motion starts (which requires a selected color).
         self.last_motion_time: Optional[float] = None
+        self.last_odom_motion_time: Optional[float] = None
         self.motion_timeout = 3.0
+        self.odom_moving_threshold = 0.02  # m/s considered "moving"
+        self.motion_check_period = 0.5
         self.motion_timeout_triggered = False
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "aurora")
         self.line_watcher = LineWatcher(get_rois(camera_type))
@@ -230,12 +234,16 @@ class ScenarioRunner(Node):
         # Track outgoing motion commands to detect stalls.
         qos_cmd = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         self.cmd_vel_sub = self.create_subscription(Twist, "/controller/cmd_vel", self._cmd_vel_cb, qos_cmd)
+        # Track odometry to confirm the robot is actually moving.
+        self.odom_sub = self.create_subscription(Odometry, "/odom", self._odom_cb, qos_cmd)
 
         # Start the first stage immediately.
         self._launch_stage(Stage.LINE)
 
         # Periodic heartbeat to log what is active.
         self.create_timer(5.0, self._log_status)
+        # Motion watchdog so stalls trigger even if images are not processed.
+        self.create_timer(self.motion_check_period, self._check_motion_timeout)
 
     # ------------------------------------------------------------------
     # Transition handling
@@ -291,12 +299,15 @@ class ScenarioRunner(Node):
         self.motion_timeout_triggered = False
         if stage == Stage.LINE:
             self.last_motion_time = None
+            self.last_odom_motion_time = None
         elif stage == Stage.GREEN:
             # Arm timeout immediately for green_nav to catch stalls.
             self.last_motion_time = time.time()
+            self.last_odom_motion_time = None
         else:
             # HRI should not have a motion timeout.
             self.last_motion_time = None
+            self.last_odom_motion_time = None
         self._attach_child_loggers()
 
         # Configure the node after a short delay to let services come up.
@@ -480,6 +491,23 @@ class ScenarioRunner(Node):
                 self._save_debug_image(image, "green_motion_timeout")
             self._launch_stage(Stage.HRI)
 
+    def _check_motion_timeout(self):
+        """Detect stalls when Twist commands persist but odom shows no motion."""
+        if self.stage == Stage.HRI or self.motion_timeout_triggered:
+            return
+        now = time.time()
+        recent_command = self.last_motion_time is not None and (now - self.last_motion_time) < self.motion_timeout
+        odom_stalled = self.last_odom_motion_time is None or (now - self.last_odom_motion_time) > self.motion_timeout
+        if self.stage in (Stage.LINE, Stage.GREEN) and recent_command and odom_stalled:
+            self.motion_timeout_triggered = True
+            next_stage = Stage.GREEN if self.stage == Stage.LINE else Stage.HRI
+            self.get_logger().info(
+                f"Motion stall detected: commands active but odom idle for {self.motion_timeout} seconds; switching to {next_stage.name}."
+            )
+            if self.save_debug_images:
+                self._save_debug_image(self.last_image, f"stall_{self.stage.name.lower()}")
+            self._launch_stage(next_stage)
+
     # ------------------------------------------------------------------
     # Logging and shutdown
     # ------------------------------------------------------------------
@@ -517,6 +545,15 @@ class ScenarioRunner(Node):
         if abs(msg.linear.x) > 1e-3 or abs(msg.linear.y) > 1e-3 or abs(msg.angular.z) > 1e-3:
             self.last_motion_time = time.time()
             self.motion_timeout_triggered = False
+
+    def _odom_cb(self, msg: Odometry):
+        """Update when odometry shows the robot actually moving."""
+        lin = msg.twist.twist.linear
+        ang = msg.twist.twist.angular
+        lin_speed = math.sqrt(lin.x ** 2 + lin.y ** 2 + lin.z ** 2)
+        ang_speed = abs(ang.z)
+        if lin_speed > self.odom_moving_threshold or ang_speed > 1e-2:
+            self.last_odom_motion_time = time.time()
 
     def destroy_node(self):
         if self.current_process and self.current_process.poll() is None:
