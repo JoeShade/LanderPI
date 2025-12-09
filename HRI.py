@@ -93,11 +93,12 @@ class FistStopNode(Node):
     def _resolve_voice_base(self):
         """
         Resolve where to load audio files from.
-        Priority: VOICE_FEEDBACK_PATH env -> package share feedback_voice -> local feedback_voice next to this file.
+        Priority: feedback_voice next to scenario_runner -> VOICE_FEEDBACK_PATH env -> package share -> local fallback next to this file.
         """
         candidates = []
-        # 1) Prefer folder next to this file (works in source and install space)
-        candidates.append(os.path.join(os.path.dirname(__file__), 'feedback_voice'))
+        # 1) Prefer folder next to scenario_runner (shared location for all nodes)
+        scenario_runner_voice = os.path.join(os.path.dirname(__file__), 'scenario_pkg', 'feedback_voice')
+        candidates.append(scenario_runner_voice)
 
         # 2) Explicit env override
         env_path = os.environ.get('VOICE_FEEDBACK_PATH')
@@ -111,6 +112,9 @@ class FistStopNode(Node):
                 candidates.append(os.path.join(pkg_share, 'feedback_voice'))
             except Exception:
                 pass
+
+        # 4) Local fallback next to this file
+        candidates.append(os.path.join(os.path.dirname(__file__), 'feedback_voice'))
 
         for path in candidates:
             if path and os.path.isdir(path):

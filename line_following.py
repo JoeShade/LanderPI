@@ -10,6 +10,16 @@ import threading
 import numpy as np
 import sdk.pid as pid
 import sdk.common as common
+try:
+    from scenario_pkg.roi_config import get_rois
+except Exception:
+    def get_rois(camera_type):
+        roi_table = {
+            "ascamera": ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1)),
+            "aurora": ((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1)),
+            "usb_cam": ((0.79, 0.81, 0, 1, 0.7), (0.67, 0.69, 0, 1, 0.2), (0.55, 0.57, 0, 1, 0.1)),
+        }
+        return roi_table.get(camera_type, roi_table["aurora"])
 from rclpy.node import Node
 from app.common import Heart
 from cv_bridge import CvBridge
@@ -48,14 +58,9 @@ class LineFollower:
         self.node = node
         self.target_lab, self.target_rgb = color
         self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
-        if self.depth_camera_type == 'ascamera':
-            self.rois = ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1))
-        elif self.depth_camera_type == 'aurora': # This is the camera we are using
-            self.rois = ((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1)) # These parameters control the region of interest
-        elif self.depth_camera_type == 'usb_cam':
-            self.rois = ((0.79, 0.81, 0, 1, 0.7), (0.67, 0.69, 0, 1, 0.2), (0.55, 0.57, 0, 1, 0.1))
-
-        self.weight_sum = 1.0
+        # Keep ROI selection in sync with scenario_runner via shared helper.
+        self.rois = get_rois(self.depth_camera_type)
+        self.weight_sum = sum(roi[-1] for roi in self.rois)
 
     @staticmethod
     def get_area_max_contour(contours, threshold=100):

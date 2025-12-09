@@ -47,6 +47,7 @@ from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 from std_srvs.srv import SetBool
 from interfaces.srv import SetString
+from scenario_pkg.roi_config import ROI_TABLE, get_rois
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -66,14 +67,6 @@ BEACON_AREA_THRESHOLD = 0.06
 # Debugging defaults.
 DEBUG_LOG_EVERY_N_FRAMES = 15
 DEBUG_OUTPUT_DIR = Path("/tmp/scenario_debug")
-
-# Region-of-interest stack matching the camera choices in line_following.py to
-# reuse its tuning. These percentages are (y_min, y_max, x_min, x_max, weight).
-ROI_TABLE = {
-    "ascamera": ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1)),
-    "aurora": ((0.81, 0.83, 0, 1, 0.7), (0.69, 0.71, 0, 1, 0.2), (0.57, 0.59, 0, 1, 0.1)),
-    "usb_cam": ((0.79, 0.81, 0, 1, 0.7), (0.67, 0.69, 0, 1, 0.2), (0.55, 0.57, 0, 1, 0.1)),
-}
 
 
 def _resolve_camera_topic(camera_type: str) -> str:
@@ -203,16 +196,20 @@ class ScenarioRunner(Node):
         self.current_process: Optional[subprocess.Popen] = None
         self.line_lost_frames = 0
         self.line_transition_armed = True  # start counting immediately to catch missing lines
-        self.frame_counter = 0
+        self.raw_frame_counter = 0  # counts every incoming image
+        self.frame_counter = 0  # counts processed images
+        self.process_every_n = max(1, int(self.declare_parameter("runner_process_every_n", 5).value))
         self.last_image: Optional[np.ndarray] = None
         self.child_log_threads: Tuple[threading.Thread, ...] = tuple()
         self.stage_start_time: float = time.time()
         self.mission_complete = False
-        self.last_motion_time = time.time()
+        self.shutdown_requested = False
+        # Stall timer arms only after motion starts (which requires a selected color).
+        self.last_motion_time: Optional[float] = None
         self.motion_timeout = 3.0
         self.motion_timeout_triggered = False
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "aurora")
-        self.line_watcher = LineWatcher(ROI_TABLE.get(camera_type, ROI_TABLE["aurora"]))
+        self.line_watcher = LineWatcher(get_rois(camera_type))
         self.green_watcher = GreenWatcher()
 
         # Precompute LAB bounds used for transition detection.
@@ -270,6 +267,15 @@ class ScenarioRunner(Node):
         self.line_lost_frames = 0
         self.frame_counter = 0
         self.stage_start_time = time.time()
+        self.motion_timeout_triggered = False
+        if stage == Stage.LINE:
+            self.last_motion_time = None
+        elif stage == Stage.GREEN:
+            # Arm timeout immediately for green_nav to catch stalls.
+            self.last_motion_time = time.time()
+        else:
+            # HRI should not have a motion timeout.
+            self.last_motion_time = None
         self._attach_child_loggers()
 
         # Configure the node after a short delay to let services come up.
@@ -368,6 +374,10 @@ class ScenarioRunner(Node):
     # Image callbacks used purely for transition decisions
     # ------------------------------------------------------------------
     def _image_cb(self, msg: Image):
+        # Throttle processing to reduce double-decoding load; the child node keeps full rate.
+        self.raw_frame_counter += 1
+        if self.raw_frame_counter % self.process_every_n != 0:
+            return
         try:
             image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="rgb8")
         except Exception as exc:  # noqa: BLE001
@@ -405,6 +415,7 @@ class ScenarioRunner(Node):
         # Secondary fallback: if no motion command for >motion_timeout seconds during LINE, switch to GREEN.
         if (
             self.stage == Stage.LINE
+            and self.last_motion_time is not None
             and not self.motion_timeout_triggered
             and (time.time() - self.last_motion_time) > self.motion_timeout
         ):
@@ -430,6 +441,22 @@ class ScenarioRunner(Node):
             if self.save_debug_images:
                 self._save_debug_image(image, "beacon_reached")
             self._launch_stage(Stage.HRI)
+            return
+
+        # If no motion command for >motion_timeout seconds during GREEN, switch to HRI as fallback.
+        if (
+            self.stage == Stage.GREEN
+            and self.last_motion_time is not None
+            and not self.motion_timeout_triggered
+            and (time.time() - self.last_motion_time) > self.motion_timeout
+        ):
+            self.motion_timeout_triggered = True
+            self.get_logger().info(
+                f"No motion command for {self.motion_timeout} seconds during GREEN; switching to HRI stage as fallback."
+            )
+            if self.save_debug_images:
+                self._save_debug_image(image, "green_motion_timeout")
+            self._launch_stage(Stage.HRI)
 
     # ------------------------------------------------------------------
     # Logging and shutdown
@@ -440,13 +467,17 @@ class ScenarioRunner(Node):
         # If HRI exits cleanly, treat the mission as complete.
         if self.stage == Stage.HRI and not running and not self.mission_complete:
             self.mission_complete = True
+            self.shutdown_requested = True
             self.get_logger().info("Mission complete: HRI exited cleanly; shutting down runner.")
             try:
                 self.cmd_vel_pub.publish(Twist())
             except Exception:
                 pass
-            # Graceful shutdown of the node and rclpy.
-            threading.Thread(target=self._shutdown_self, daemon=True).start()
+            # Graceful shutdown of rclpy; node cleanup happens in main thread after spin exits.
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
     def _save_debug_image(self, image: Optional[np.ndarray], label: str):
         if image is None:
@@ -476,16 +507,6 @@ class ScenarioRunner(Node):
         self._join_child_loggers()
         super().destroy_node()
 
-    def _shutdown_self(self):
-        """Shut down rclpy after mission completion without deadlocking timers."""
-        try:
-            self.destroy_node()
-        finally:
-            try:
-                rclpy.shutdown()
-            except Exception:
-                pass
-
 
 def main():
     runner = ScenarioRunner()
@@ -494,8 +515,14 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        runner.destroy_node()
-        rclpy.shutdown()
+        try:
+            runner.destroy_node()
+        except Exception:
+            pass
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

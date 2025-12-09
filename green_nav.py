@@ -105,6 +105,35 @@ class GreenLineFollowingNode(Node):
     window_claimed = False
     window_lock_path = WINDOW_LOCK_PATH
 
+    @staticmethod
+    def _is_pid_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except OSError as exc:
+            return exc.errno == errno.EPERM  # process exists but no permission
+        return True
+
+    @classmethod
+    def _clear_stale_window_lock(cls, logger):
+        """Remove lock if owning process is gone to avoid long waits after crashes."""
+        path = cls.window_lock_path
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, "r") as fh:
+                content = fh.read().strip()
+            pid = int(content) if content else None
+        except Exception:
+            pid = None
+        stale = pid is None or not cls._is_pid_running(pid)
+        if stale:
+            try:
+                os.remove(path)
+                if logger:
+                    logger.info(f"Removed stale window lockfile (pid={pid}) at {path}")
+            except Exception:
+                pass
+
     def __init__(self, name: str):
         rclpy.init()
         super().__init__(name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
@@ -129,7 +158,9 @@ class GreenLineFollowingNode(Node):
         self.pid = pid.PID(0.020, 0.003, 0.0)
 
         # Voice prompts and cooldowns
-        self.voice_base = os.environ.get('VOICE_FEEDBACK_PATH') or os.path.join(os.path.dirname(__file__), 'feedback_voice')
+        scenario_runner_voice = os.path.join(os.path.dirname(__file__), 'scenario_pkg', 'feedback_voice')
+        default_voice_base = scenario_runner_voice if os.path.isdir(scenario_runner_voice) else os.path.join(os.path.dirname(__file__), 'feedback_voice')
+        self.voice_base = os.environ.get('VOICE_FEEDBACK_PATH') or default_voice_base
         os.environ.setdefault('VOICE_FEEDBACK_PATH', self.voice_base)
         self.voice_enabled = bool(self.declare_parameter('voice_feedback', VOICE_FEEDBACK_DEFAULT).value)
         self.voice_cooldown = DEFAULT_VOICE_COOLDOWN
@@ -304,15 +335,10 @@ class GreenLineFollowingNode(Node):
         self.smoothed_avoidance_bias = 0.0
         self.mecanum_pub.publish(Twist())
         self.log_debug(f"Target reached: area_ratio={area_ratio:.3f} (threshold={self.target_reached_area_ratio})")
-        # Schedule a quick 180-degree spin in place after reaching the target.
-        turn_rate = self.max_avoidance_turn * self.avoidance_turn_in_place_gain * self.target_spin_rate_multiplier
-        turn_rate = max(turn_rate, math.radians(90))
-        spin_duration = math.pi / max(abs(turn_rate), 1e-3)
-        self.target_spin_rate = turn_rate
         self._play_voice('success.wav')
-        spin_start = time.time()
-        self.target_spin_until = spin_start + spin_duration
-        self.log_debug(f"Target spin scheduled: rate={turn_rate:.2f} rad/s, duration={spin_duration:.2f}s")
+        # Cancel any pending spins and hold position.
+        self.target_spin_until = None
+        self.target_spin_rate = 0.0
         return True
 
     # -----------------------------
@@ -642,16 +668,6 @@ class GreenLineFollowingNode(Node):
             avoidance_now = self.is_running and self.avoidance_engaged
 
             self._handle_voice_prompts(searching_now, has_target, avoidance_now, just_entered_turn_in_place)
-            spin_active = self.target_spin_until is not None and now < self.target_spin_until
-            if not spin_active and self.target_spin_until is not None and now >= self.target_spin_until:
-                # Finish spin: stop and clear.
-                self.target_spin_until = None
-                self.mecanum_pub.publish(Twist())
-                self.log_debug("[target] spin complete; stopping.")
-            if spin_active:
-                twist.angular.z = self.target_spin_rate
-                twist.linear.x = 0.0
-                self.mecanum_pub.publish(twist)
             if retreat_active and self.is_running:
                 twist.angular.z = 0.0
                 twist.linear.x = -self.base_forward_speed
@@ -714,19 +730,16 @@ class GreenLineFollowingNode(Node):
         # Show live camera view in an OpenCV window
         try:
             if not self.window_initialized and not GreenLineFollowingNode.window_claimed:
-                # Clear stale lockfiles so a crash doesn't block new windows.
-                if os.path.exists(GreenLineFollowingNode.window_lock_path):
-                    try:
-                        mtime = os.path.getmtime(GreenLineFollowingNode.window_lock_path)
-                        if (time.time() - mtime) > 300:
-                            os.remove(GreenLineFollowingNode.window_lock_path)
-                            self.log_debug("Removed stale window lockfile (>5m old).")
-                    except Exception:
-                        pass
+                # Clear stale lockfiles by verifying owning PID instead of waiting 5 minutes.
+                GreenLineFollowingNode._clear_stale_window_lock(self.get_logger() if self.debug else None)
                 # Attempt to claim a cross-process lock to avoid duplicate windows.
                 try:
                     flags = os.O_CREAT | os.O_EXCL | os.O_RDWR
                     self.window_lock_handle = os.open(GreenLineFollowingNode.window_lock_path, flags)
+                    try:
+                        os.write(self.window_lock_handle, str(os.getpid()).encode())
+                    except Exception:
+                        pass
                     GreenLineFollowingNode.window_claimed = True
                     self.window_initialized = True
                     self.window_enabled = True

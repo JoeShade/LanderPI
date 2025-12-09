@@ -13,6 +13,8 @@ setup(
         ('share/' + package_name + '/launch', glob('launch/*.launch.py')),
         # Install the original scripts so the runner can invoke them from the installed share.
         ('share/' + package_name, ['line_following.py', 'green_nav.py', 'HRI.py']),
+        # Shared audio directory next to scenario_runner.py for all nodes.
+        ('share/' + package_name + '/scenario_pkg/feedback_voice', glob('scenario_pkg/feedback_voice/*')),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
