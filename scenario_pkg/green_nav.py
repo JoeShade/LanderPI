@@ -50,6 +50,22 @@ VOICE_FEEDBACK_DEFAULT = True  # global flag so voice can be toggled from one pl
 # -------------
 # Vision helper
 # -------------
+def _load_lab_config():
+    """Resolve LAB config from env override or user home; return empty dict on failure."""
+    candidates = []
+    env_path = os.environ.get("LAB_CONFIG_PATH")
+    if env_path:
+        candidates.append(os.path.expanduser(env_path))
+    candidates.append(os.path.expanduser("~/software/lab_tool/lab_config.yaml"))
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return common.get_yaml_data(path)
+            except Exception:
+                break
+    return {}
+
+
 class LineFollower:
     """Detects the green target and returns how far off-center it sits."""
 
@@ -152,7 +168,7 @@ class GreenLineFollowingNode(Node):
         self.window_initialized = False
         self.window_enabled = False
         self.window_lock_handle = None
-        self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
+        self.lab_data = _load_lab_config()
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
         lab_map = self.lab_data.get('lab', {})
         self.lab_lookup_type = self.camera_type if self.camera_type in lab_map else 'ascamera'

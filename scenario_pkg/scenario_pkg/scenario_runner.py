@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
@@ -38,6 +39,7 @@ import numpy as np
 import rclpy
 from ament_index_python.packages import get_package_share_directory
 from cv_bridge import CvBridge
+from geometry_msgs.msg import Twist
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy
@@ -74,6 +76,18 @@ ROI_TABLE = {
 }
 
 
+def _resolve_camera_topic(camera_type: str) -> str:
+    """Pick a camera topic that matches the active sensor; env IMAGE_TOPIC overrides."""
+    env_topic = os.environ.get("IMAGE_TOPIC") or os.environ.get("CAMERA_TOPIC")
+    if env_topic:
+        return env_topic
+    if camera_type == "usb_cam":
+        return "/camera/image"
+    if camera_type in ("ascamera", "aurora"):
+        return "/ascamera/camera_publisher/rgb0/image"
+    return "/camera/image_raw"
+
+
 class Stage(Enum):
     """High-level mission stages."""
 
@@ -89,8 +103,12 @@ class LineWatcher:
         self.rois = rois
         self.weight_sum = sum(roi[-1] for roi in rois)
         # Require more substantive detections so scattered carpet specks are ignored.
-        self.min_contour_area = 400
-        self.min_mask_ratio = 0.004  # fraction of ROI pixels that must be non-zero
+        # The ratios are slightly conservative so that once the line is gone we
+        # quickly classify frames as misses instead of bouncing on tiny blobs.
+        self.min_contour_area = 500
+        self.min_mask_ratio = 0.01  # fraction of ROI pixels that must be non-zero
+        self.min_total_mask_ratio = 0.03  # combined ROI coverage required to count as "line seen"
+        self.min_hit_rois = 1
 
     @staticmethod
     def _largest_contour(contours, threshold=120):
@@ -100,12 +118,13 @@ class LineWatcher:
             return max(contour_area, key=lambda c_a: c_a[1])
         return None
 
-    def detect_angle(self, image: np.ndarray, lowerb, upperb) -> Tuple[Optional[float], int]:
-        """Return (steering angle, hit_count). Angle is None if too few ROI hits."""
+    def detect_angle(self, image: np.ndarray, lowerb, upperb) -> Tuple[Optional[float], int, float]:
+        """Return (steering angle, hit_count, total_mask_ratio). Angle is None if too few ROI hits."""
 
         h, w = image.shape[:2]
         centroid_sum = 0.0
         hit_count = 0
+        total_mask_ratio = 0.0
         for roi in self.rois:
             blob = image[int(roi[0] * h): int(roi[1] * h), int(roi[2] * w): int(roi[3] * w)]
             mask = cv2.inRange(cv2.cvtColor(blob, cv2.COLOR_RGB2LAB), lowerb, upperb)
@@ -113,6 +132,7 @@ class LineWatcher:
             mask_ratio = float(cv2.countNonZero(mask)) / max(mask.size, 1)
             if mask_ratio < self.min_mask_ratio:
                 continue
+            total_mask_ratio += mask_ratio
             eroded = cv2.erode(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             dilated = cv2.dilate(eroded, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
             contours = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_L1)[-2]
@@ -126,11 +146,11 @@ class LineWatcher:
                 cv2.circle(blob, (int(center_x), int(center_y)), 3, (255, 0, 0), -1)
                 centroid_sum += center_x * roi[-1]
 
-        if centroid_sum == 0 or hit_count < 2:
-            return None, hit_count
+        if centroid_sum == 0 or hit_count < self.min_hit_rois or total_mask_ratio < self.min_total_mask_ratio:
+            return None, hit_count, total_mask_ratio
         center_pos = centroid_sum / max(self.weight_sum, 1e-6)
         deflection_angle = -math.atan((center_pos - (w / 2.0)) / (h / 2.0))
-        return deflection_angle, hit_count
+        return deflection_angle, hit_count, total_mask_ratio
 
 
 class GreenWatcher:
@@ -170,7 +190,8 @@ class ScenarioRunner(Node):
         # Camera helpers for transition sensing.
         self.bridge = CvBridge()
         # Camera subscription (align with line_following/green_nav expectations).
-        self.camera_topic = "/ascamera/camera_publisher/rgb0/image"
+        camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "aurora")
+        self.camera_topic = _resolve_camera_topic(camera_type)
         qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
         self.image_sub = self.create_subscription(Image, self.camera_topic, self._image_cb, qos)
 
@@ -181,10 +202,15 @@ class ScenarioRunner(Node):
         self.stage = Stage.LINE
         self.current_process: Optional[subprocess.Popen] = None
         self.line_lost_frames = 0
-        self.line_transition_armed = False
+        self.line_transition_armed = True  # start counting immediately to catch missing lines
         self.frame_counter = 0
         self.last_image: Optional[np.ndarray] = None
         self.child_log_threads: Tuple[threading.Thread, ...] = tuple()
+        self.stage_start_time: float = time.time()
+        self.mission_complete = False
+        self.last_motion_time = time.time()
+        self.motion_timeout = 3.0
+        self.motion_timeout_triggered = False
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "aurora")
         self.line_watcher = LineWatcher(ROI_TABLE.get(camera_type, ROI_TABLE["aurora"]))
         self.green_watcher = GreenWatcher()
@@ -197,6 +223,11 @@ class ScenarioRunner(Node):
 
         # Allow external introspection when diagnosing issues.
         self.create_service(Trigger, "get_status", self._handle_get_status)
+        # Safety stop publisher in case a child process is terminated mid-motion.
+        self.cmd_vel_pub = self.create_publisher(Twist, "/controller/cmd_vel", 1)
+        # Track outgoing motion commands to detect stalls.
+        qos_cmd = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
+        self.cmd_vel_sub = self.create_subscription(Twist, "/controller/cmd_vel", self._cmd_vel_cb, qos_cmd)
 
         # Start the first stage immediately.
         self._launch_stage(Stage.LINE)
@@ -211,6 +242,8 @@ class ScenarioRunner(Node):
         """Start the requested stage's original script as a subprocess."""
 
         self._stop_child_process()
+        # Give the OS a moment to release resources (audio, camera) from the previous process.
+        time.sleep(1.0)
 
         script_map = {
             Stage.LINE: str(self.share_dir / "line_following.py"),
@@ -236,6 +269,7 @@ class ScenarioRunner(Node):
         self.stage = stage
         self.line_lost_frames = 0
         self.frame_counter = 0
+        self.stage_start_time = time.time()
         self._attach_child_loggers()
 
         # Configure the node after a short delay to let services come up.
@@ -256,6 +290,11 @@ class ScenarioRunner(Node):
             except subprocess.TimeoutExpired:
                 self.get_logger().warning("Force-killing previous stage")
                 self.current_process.kill()
+        # SAFETY: force an immediate stop to clear any lingering wheel commands.
+        try:
+            self.cmd_vel_pub.publish(Twist())
+        except Exception:
+            pass
         self._join_child_loggers()
 
     def _call_service(self, srv_type, name: str, request):
@@ -343,10 +382,9 @@ class ScenarioRunner(Node):
             self._handle_green_stage(image)
 
     def _handle_line_stage(self, image: np.ndarray):
-        angle, hits = self.line_watcher.detect_angle(image, self.black_lower, self.black_upper)
-        if angle is not None:
-            # Arm the transition logic only after we have seen a valid line once.
-            self.line_transition_armed = True
+        angle, hits, coverage = self.line_watcher.detect_angle(image, self.black_lower, self.black_upper)
+        line_seen = angle is not None
+        if line_seen:
             self.line_lost_frames = 0
         elif self.line_transition_armed:
             self.line_lost_frames += 1
@@ -354,7 +392,7 @@ class ScenarioRunner(Node):
         if self.debug_mode and self.frame_counter % self.debug_log_every_n == 0:
             self.get_logger().info(
                 f"[LINE debug] frame={self.frame_counter}, angle={angle if angle is not None else 'none'}, "
-                f"hits={hits}, lost_frames={self.line_lost_frames}"
+                f"hits={hits}, coverage={coverage:.4f}, lost_frames={self.line_lost_frames}"
             )
 
         if self.line_transition_armed and self.line_lost_frames >= LINE_LOST_FRAMES:
@@ -362,8 +400,26 @@ class ScenarioRunner(Node):
             if self.save_debug_images:
                 self._save_debug_image(image, "line_lost")
             self._launch_stage(Stage.GREEN)
+            return
+
+        # Secondary fallback: if no motion command for >motion_timeout seconds during LINE, switch to GREEN.
+        if (
+            self.stage == Stage.LINE
+            and not self.motion_timeout_triggered
+            and (time.time() - self.last_motion_time) > self.motion_timeout
+        ):
+            self.motion_timeout_triggered = True
+            self.get_logger().info(
+                f"No motion command for {self.motion_timeout} seconds; switching to GREEN stage as fallback."
+            )
+            if self.save_debug_images:
+                self._save_debug_image(image, "motion_timeout")
+            self._launch_stage(Stage.GREEN)
 
     def _handle_green_stage(self, image: np.ndarray):
+        # Ignore green-stage detections until the camera/servos have time to move.
+        if time.time() - self.stage_start_time < 2.0:
+            return
         area_ratio = self.green_watcher.area_ratio(image, self.green_lower, self.green_upper)
         if self.debug_mode and self.frame_counter % self.debug_log_every_n == 0:
             self.get_logger().info(f"[GREEN debug] frame={self.frame_counter}, beacon_area={area_ratio:.4f}")
@@ -381,6 +437,16 @@ class ScenarioRunner(Node):
     def _log_status(self):
         running = self.current_process and self.current_process.poll() is None
         self.get_logger().info(f"Stage={self.stage.name}, child_running={running}, lost_frames={self.line_lost_frames}")
+        # If HRI exits cleanly, treat the mission as complete.
+        if self.stage == Stage.HRI and not running and not self.mission_complete:
+            self.mission_complete = True
+            self.get_logger().info("Mission complete: HRI exited cleanly; shutting down runner.")
+            try:
+                self.cmd_vel_pub.publish(Twist())
+            except Exception:
+                pass
+            # Graceful shutdown of the node and rclpy.
+            threading.Thread(target=self._shutdown_self, daemon=True).start()
 
     def _save_debug_image(self, image: Optional[np.ndarray], label: str):
         if image is None:
@@ -393,6 +459,12 @@ class ScenarioRunner(Node):
         except Exception as exc:  # noqa: BLE001
             self.get_logger().warning(f"Failed to save debug frame {filename}: {exc}")
 
+    def _cmd_vel_cb(self, msg: Twist):
+        """Track last non-zero motion command to detect stalls."""
+        if abs(msg.linear.x) > 1e-3 or abs(msg.linear.y) > 1e-3 or abs(msg.angular.z) > 1e-3:
+            self.last_motion_time = time.time()
+            self.motion_timeout_triggered = False
+
     def destroy_node(self):
         if self.current_process and self.current_process.poll() is None:
             self.get_logger().info("Terminating active child before shutdown")
@@ -403,6 +475,16 @@ class ScenarioRunner(Node):
                 self.current_process.kill()
         self._join_child_loggers()
         super().destroy_node()
+
+    def _shutdown_self(self):
+        """Shut down rclpy after mission completion without deadlocking timers."""
+        try:
+            self.destroy_node()
+        finally:
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 def main():

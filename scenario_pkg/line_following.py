@@ -25,6 +25,22 @@ from servo_controller.bus_servo_control import set_servo_position
 
 
 MAX_SCAN_ANGLE = 240  # degree(the scanning angle of lidar. The covered part is always eliminated)
+
+
+def _load_lab_config():
+    """Resolve LAB config from env override or user home; return empty dict on failure."""
+    candidates = []
+    env_path = os.environ.get("LAB_CONFIG_PATH")
+    if env_path:
+        candidates.append(os.path.expanduser(env_path))
+    candidates.append(os.path.expanduser("~/software/lab_tool/lab_config.yaml"))
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return common.get_yaml_data(path)
+            except Exception:
+                break
+    return {}
 class LineFollower:
     def __init__(self, color, node):
         self.node = node
@@ -135,7 +151,7 @@ class LineFollowingNode(Node):
         self.image_width = None
         self.bridge = CvBridge()
         self.use_color_picker = True
-        self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
+        self.lab_data = _load_lab_config()
         self.image_queue = queue.Queue(2)
         self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
         # Select lab profile: prefer configured camera, else ascamera, else first available, else None.
