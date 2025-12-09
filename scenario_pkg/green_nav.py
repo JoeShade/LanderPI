@@ -167,6 +167,8 @@ class GreenLineFollowingNode(Node):
         self.announced_search = False
         self.announced_acquired = False
         self.announced_avoidance = False
+        self._servo_log_cooldown = 0.50  # seconds between logging servo commands
+        self._last_servo_log = 0.0
 
         # Search/target tuning; configurable via ROS parameters
         self.search_angular_speed = float(self.declare_parameter('search_angular_speed', DEFAULT_SEARCH_ANGULAR_SPEED).value)
@@ -377,6 +379,15 @@ class GreenLineFollowingNode(Node):
     # -----------------------------
     # Servos and service endpoints
     # -----------------------------
+    def _set_servo_position(self, positions, duration=1.0, label=None):
+        """Send servo commands and log them at most every 500 ms."""
+        now = time.time()
+        if (now - self._last_servo_log) >= self._servo_log_cooldown:
+            tag = f" {label}" if label else ""
+            self.get_logger().info(f"[servo]{tag}: {positions}")
+            self._last_servo_log = now
+        set_servo_position(self.joints_pub, duration, positions)
+
     def pwm_controller(self, position_data):
         """Send a small list of servo positions to the controller."""
         pwm_list = []
@@ -410,7 +421,7 @@ class GreenLineFollowingNode(Node):
             if self.lidar_sub is None:
                 qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
                 self.lidar_sub = self.create_subscription(LaserScan, '/scan_raw', self.lidar_callback, qos)
-                set_servo_position(self.joints_pub, 1, ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))) # Pitched robot arm up to see green beacon
+                self._set_servo_position(((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500)), 1, "green_nav_pose") # Pitched robot arm up to see green beacon
             self.mecanum_pub.publish(Twist())
         response.success = True
         response.message = "enter"

@@ -88,6 +88,8 @@ class FistStopNode(Node):
         # servos when a gesture is confirmed.
         self.mecanum_pub = self.create_publisher(Twist, '/controller/cmd_vel', 1)
         self.joints_pub = self.create_publisher(ServosPosition, '/servo_controller', 1)
+        self._servo_log_cooldown = 0.50  # seconds between logging servo commands
+        self._last_servo_log = 0.0
 
         # Camera Subscription
         # Images are queued so the processing thread always sees the freshest
@@ -243,18 +245,27 @@ class FistStopNode(Node):
                 extended_count += 1
         return extended_count >= 4
 
+    def _set_servo_position(self, positions, duration=1.0, label=None):
+        """Send a servo command and log it no more than every 250 ms."""
+        now = time.time()
+        if (now - self._last_servo_log) >= self._servo_log_cooldown:
+            tag = f" {label}" if label else ""
+            self.get_logger().info(f"[servo]{tag}: {positions}")
+            self._last_servo_log = now
+        set_servo_position(self.joints_pub, duration, positions)
+
     def set_camera_posture(self, mode):
         """Move the camera servos into sensible poses for each action."""
         # 10=Clamp, 5=Wrist, 4=Elbow, 3=Shoulder, 2=Tilt, 1=Pan
         if mode == 'drive':
             positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))
-            set_servo_position(self.joints_pub, 1.0, positions)
+            self._set_servo_position(positions, 1.0, "drive_pose")
         elif mode == 'look_up':
             positions = ((10, 200), (5, 500), (4, 90), (3, 350), (2, 780), (1, 500))
-            set_servo_position(self.joints_pub, 1.0, positions)
+            self._set_servo_position(positions, 1.0, "look_up_pose")
         elif mode == 'look_down':
             positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 550), (1, 500))
-            set_servo_position(self.joints_pub, 1.0, positions)
+            self._set_servo_position(positions, 1.0, "look_down_pose")
         time.sleep(0.5)
 
     def stop_robot(self):
@@ -285,7 +296,7 @@ class FistStopNode(Node):
         """Survivor rotation: Right (Negative Z), Opposite to rotate_once"""
         self.get_logger().warn("Survivor found. Rotating Opposite (Right)...")
         positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))
-        set_servo_position(self.joints_pub, 1.0, positions)
+        self._set_servo_position(positions, 1.0, "rotate_opposite")
         twist = Twist()
         twist.angular.z = -1.5 # Negative for opposite direction
         self.mecanum_pub.publish(twist)
@@ -332,7 +343,7 @@ class FistStopNode(Node):
         for pan, tilt in pan_tilt_sequence:
             positions = base_pose + ((2, tilt), (1, pan))
             self.get_logger().info(f"Scanning pan={pan}, tilt={tilt}")
-            set_servo_position(self.joints_pub, 1.0, positions)
+            self._set_servo_position(positions, 1.0, "scan")
             time.sleep(0.3)  # allow movement to settle
             result = self.check_gestures(1.5)
             if result:
@@ -377,16 +388,16 @@ class FistStopNode(Node):
                 self._play_voice('Survivor') # Make sure survivor.wav exists
                 # Keep tilt level (no downward tilt) and speed up sweep
                 positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 220))  # left
-                set_servo_position(self.joints_pub, 1.0, positions)
+                self._set_servo_position(positions, 1.0, "wave_left")
                 time.sleep(0.25)
                 positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 780))  # right
-                set_servo_position(self.joints_pub, 1.0, positions)
+                self._set_servo_position(positions, 1.0, "wave_right")
                 time.sleep(0.25)
                 positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 220))  # back left
-                set_servo_position(self.joints_pub, 1.0, positions)
+                self._set_servo_position(positions, 1.0, "wave_back_left")
                 time.sleep(0.25)
                 positions = ((10, 200), (5, 500), (4, 90), (3, 150), (2, 780), (1, 500))  # center
-                set_servo_position(self.joints_pub, 1.0, positions)
+                self._set_servo_position(positions, 1.0, "wave_center")
                 # Return to scanning posture and pause before resuming search
                 self.set_camera_posture('look_up')
                 time.sleep(3.0)

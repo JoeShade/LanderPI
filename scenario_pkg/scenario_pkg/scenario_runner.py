@@ -217,6 +217,13 @@ class ScenarioRunner(Node):
         self.odom_moving_threshold = 0.02  # m/s considered "moving"
         self.motion_check_period = 0.5
         self.motion_timeout_triggered = False
+        self.last_cmd_vel_log_time = 0.0
+        self.last_odom_log_time = 0.0
+        self.motion_log_interval = 2.0
+        self.odom_seen = False
+        self.last_odom_msg_time: Optional[float] = None
+        self.missing_odom_logged = False
+        self.transition_lock = threading.Lock()
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "aurora")
         self.line_watcher = LineWatcher(get_rois(camera_type))
         self.green_watcher = GreenWatcher()
@@ -229,6 +236,8 @@ class ScenarioRunner(Node):
 
         # Allow external introspection when diagnosing issues.
         self.create_service(Trigger, "get_status", self._handle_get_status)
+        # Allow manual override when recovering from stalls or testing.
+        self.create_service(SetString, "set_stage", self._handle_set_stage)
         # Safety stop publisher in case a child process is terminated mid-motion.
         self.cmd_vel_pub = self.create_publisher(Twist, "/controller/cmd_vel", 1)
         # Track outgoing motion commands to detect stalls.
@@ -251,7 +260,12 @@ class ScenarioRunner(Node):
     def _launch_stage(self, stage: Stage):
         """Start the requested stage's original script as a subprocess."""
 
-        self._stop_child_process()
+        with self.transition_lock:
+            self._stop_child_process()
+            self._launch_stage_locked(stage)
+
+    def _launch_stage_locked(self, stage: Stage):
+        """Internal helper; caller must hold transition_lock."""
         # Give the OS a moment to release resources (audio, camera) from the previous process.
         time.sleep(1.0)
 
@@ -308,6 +322,10 @@ class ScenarioRunner(Node):
             # HRI should not have a motion timeout.
             self.last_motion_time = None
             self.last_odom_motion_time = None
+        self.odom_seen = False
+        self.last_odom_msg_time = None
+        self.missing_odom_logged = False
+        self.get_logger().info(f"Stage {self.stage.name} launched (pid={self.current_process.pid if self.current_process else 'n/a'})")
         self._attach_child_loggers()
 
         # Configure the node after a short delay to let services come up.
@@ -325,9 +343,15 @@ class ScenarioRunner(Node):
             self.current_process.terminate()
             try:
                 self.current_process.wait(timeout=5)
+                self.get_logger().info(f"Child exited with code {self.current_process.returncode}")
             except subprocess.TimeoutExpired:
                 self.get_logger().warning("Force-killing previous stage")
                 self.current_process.kill()
+                try:
+                    self.current_process.wait(timeout=3)
+                    self.get_logger().info(f"Child killed; exit code {self.current_process.returncode}")
+                except subprocess.TimeoutExpired:
+                    self.get_logger().error("Child did not terminate after kill()")
         # SAFETY: force an immediate stop to clear any lingering wheel commands.
         try:
             self.cmd_vel_pub.publish(Twist())
@@ -352,7 +376,9 @@ class ScenarioRunner(Node):
         if future.exception() is not None:
             self.get_logger().warning(f"Service {name} failed: {future.exception()}")
             return False
-        return getattr(future.result(), "success", True)
+        success = getattr(future.result(), "success", True)
+        self.get_logger().info(f"Service {name} completed (success={success})")
+        return success
 
     def _attach_child_loggers(self):
         if not self.debug_mode or not self.current_process:
@@ -403,6 +429,25 @@ class ScenarioRunner(Node):
         )
         return response
 
+    def _handle_set_stage(self, request, response):
+        """Manual override to force a stage transition (e.g., to recover from stalls)."""
+        target = (request.data or "").strip().upper()
+        next_stage = None
+        if target in ("LINE", "GREEN", "HRI"):
+            next_stage = Stage[target]
+        elif target == "NEXT":
+            next_stage = Stage.GREEN if self.stage == Stage.LINE else Stage.HRI
+        else:
+            response.success = False
+            response.message = "Invalid stage. Use LINE, GREEN, HRI, or NEXT."
+            return response
+
+        self.get_logger().info(f"Manual override: forcing stage {next_stage.name}")
+        self._launch_stage(next_stage)
+        response.success = True
+        response.message = f"Switched to {next_stage.name}"
+        return response
+
     # ------------------------------------------------------------------
     # Image callbacks used purely for transition decisions
     # ------------------------------------------------------------------
@@ -423,6 +468,10 @@ class ScenarioRunner(Node):
             self._handle_line_stage(image)
         elif self.stage == Stage.GREEN:
             self._handle_green_stage(image)
+        if self.frame_counter % self.debug_log_every_n == 0:
+            self.get_logger().info(
+                f"[frames] raw={self.raw_frame_counter}, processed={self.frame_counter}, stage={self.stage.name}, process_every_n={self.process_every_n}"
+            )
 
     def _handle_line_stage(self, image: np.ndarray):
         angle, hits, coverage = self.line_watcher.detect_angle(image, self.black_lower, self.black_upper)
@@ -454,7 +503,7 @@ class ScenarioRunner(Node):
         ):
             self.motion_timeout_triggered = True
             self.get_logger().info(
-                f"No motion command for {self.motion_timeout} seconds; switching to GREEN stage as fallback."
+                f"No motion command for {self.motion_timeout} seconds; switching to GREEN stage as fallback (stage_time={time.time() - self.stage_start_time:.1f}s)."
             )
             if self.save_debug_images:
                 self._save_debug_image(image, "motion_timeout")
@@ -469,7 +518,7 @@ class ScenarioRunner(Node):
             self.get_logger().info(f"[GREEN debug] frame={self.frame_counter}, beacon_area={area_ratio:.4f}")
         if area_ratio >= BEACON_AREA_THRESHOLD:
             self.get_logger().info(
-                f"Beacon reached (area ratio {area_ratio:.3f} >= {BEACON_AREA_THRESHOLD}), switching to HRI"
+                f"Beacon reached (area ratio {area_ratio:.3f} >= {BEACON_AREA_THRESHOLD}), switching to HRI (stage_time={time.time() - self.stage_start_time:.1f}s)"
             )
             if self.save_debug_images:
                 self._save_debug_image(image, "beacon_reached")
@@ -485,7 +534,7 @@ class ScenarioRunner(Node):
         ):
             self.motion_timeout_triggered = True
             self.get_logger().info(
-                f"No motion command for {self.motion_timeout} seconds during GREEN; switching to HRI stage as fallback."
+                f"No motion command for {self.motion_timeout} seconds during GREEN; switching to HRI stage as fallback (stage_time={time.time() - self.stage_start_time:.1f}s)."
             )
             if self.save_debug_images:
                 self._save_debug_image(image, "green_motion_timeout")
@@ -498,6 +547,19 @@ class ScenarioRunner(Node):
         now = time.time()
         recent_command = self.last_motion_time is not None and (now - self.last_motion_time) < self.motion_timeout
         odom_stalled = self.last_odom_motion_time is None or (now - self.last_odom_motion_time) > self.motion_timeout
+        if not self.odom_seen:
+            if not self.missing_odom_logged:
+                self.get_logger().warning("Stall watchdog armed but no /odom received yet; skipping stall check until odom arrives.")
+                self.missing_odom_logged = True
+            return
+        if self.last_odom_msg_time and (now - self.last_odom_msg_time) > max(self.motion_timeout, 2 * self.motion_check_period):
+            self.get_logger().warning(f"Odom data stale ({now - self.last_odom_msg_time:.2f}s); skipping stall check this cycle.")
+            return
+        self.get_logger().info(
+            f"[motion_watch] stage={self.stage.name}, recent_cmd={recent_command}, "
+            f"since_cmd={(now - self.last_motion_time) if self.last_motion_time else 'n/a'}, "
+            f"since_odom={(now - self.last_odom_motion_time) if self.last_odom_motion_time else 'n/a'}"
+        )
         if self.stage in (Stage.LINE, Stage.GREEN) and recent_command and odom_stalled:
             self.motion_timeout_triggered = True
             next_stage = Stage.GREEN if self.stage == Stage.LINE else Stage.HRI
@@ -513,7 +575,12 @@ class ScenarioRunner(Node):
     # ------------------------------------------------------------------
     def _log_status(self):
         running = self.current_process and self.current_process.poll() is None
-        self.get_logger().info(f"Stage={self.stage.name}, child_running={running}, lost_frames={self.line_lost_frames}")
+        pid_info = f"pid={self.current_process.pid}" if self.current_process else "pid=n/a"
+        retcode = self.current_process.returncode if self.current_process else None
+        self.get_logger().info(
+            f"Stage={self.stage.name}, child_running={running}, {pid_info}, returncode={retcode}, lost_frames={self.line_lost_frames}, "
+            f"mission_complete={self.mission_complete}, shutdown_requested={self.shutdown_requested}, motion_timeout_triggered={self.motion_timeout_triggered}"
+        )
         # If HRI exits cleanly, treat the mission as complete.
         if self.stage == Stage.HRI and not running and not self.mission_complete:
             self.mission_complete = True
@@ -528,6 +595,8 @@ class ScenarioRunner(Node):
                 rclpy.shutdown()
             except Exception:
                 pass
+        elif not running and self.current_process:
+            self.get_logger().warning(f"Child for stage {self.stage.name} exited unexpectedly (returncode={self.current_process.returncode})")
 
     def _save_debug_image(self, image: Optional[np.ndarray], label: str):
         if image is None:
@@ -545,6 +614,11 @@ class ScenarioRunner(Node):
         if abs(msg.linear.x) > 1e-3 or abs(msg.linear.y) > 1e-3 or abs(msg.angular.z) > 1e-3:
             self.last_motion_time = time.time()
             self.motion_timeout_triggered = False
+        if (time.time() - self.last_cmd_vel_log_time) >= self.motion_log_interval:
+            self.last_cmd_vel_log_time = time.time()
+            self.get_logger().info(
+                f"[cmd_vel] lin=({msg.linear.x:.3f},{msg.linear.y:.3f},{msg.linear.z:.3f}), ang=({msg.angular.x:.3f},{msg.angular.y:.3f},{msg.angular.z:.3f})"
+            )
 
     def _odom_cb(self, msg: Odometry):
         """Update when odometry shows the robot actually moving."""
@@ -552,8 +626,13 @@ class ScenarioRunner(Node):
         ang = msg.twist.twist.angular
         lin_speed = math.sqrt(lin.x ** 2 + lin.y ** 2 + lin.z ** 2)
         ang_speed = abs(ang.z)
+        self.odom_seen = True
+        self.last_odom_msg_time = time.time()
         if lin_speed > self.odom_moving_threshold or ang_speed > 1e-2:
             self.last_odom_motion_time = time.time()
+        if (time.time() - self.last_odom_log_time) >= self.motion_log_interval:
+            self.last_odom_log_time = time.time()
+            self.get_logger().info(f"[odom] lin_speed={lin_speed:.3f}, ang_speed={ang_speed:.3f}")
 
     def destroy_node(self):
         if self.current_process and self.current_process.poll() is None:

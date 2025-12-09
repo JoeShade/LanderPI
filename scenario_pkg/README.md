@@ -13,21 +13,41 @@ This ROS 2 Python package orchestrates the full `line_following.py`, `green_nav.
 
 ## Build the package
 
-1. Place this repository (or at least the `scenario_pkg` folder plus its sibling scripts) inside your ROS 2 workspace `src/` directory.
-2. From the workspace root, build with `colcon`:
-   ```bash
-   colcon build --packages-select scenario_pkg
-   ```
-3. Source the overlay (replace `~/ws` with your workspace path if different):
-   ```bash
-   source install/setup.bash
-   ```
+1) Place this repository (or at least the `scenario_pkg` folder plus its sibling scripts) inside your ROS 2 workspace `src/` directory (example on target device):
+```bash
+cp -r /home/ubuntu/shared/scenario_pkg ~/ros2_ws/src/
+```
+
+2) Build and source:
+```bash
+cd ~/ros2_ws
+rm -rf build/scenario_pkg install/scenario_pkg log/latest
+colcon build --packages-select scenario_pkg --symlink-install
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+```
+
+3) Ensure the `scenario_runner` entrypoint exists in the install space (only needed if it did not get generated):
+```bash
+mkdir -p ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg
+cat <<'EOF' > ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg/scenario_runner
+#!/usr/bin/env bash
+exec /usr/bin/env python3 -m scenario_pkg.scenario_runner "$@"
+EOF
+chmod +x ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg/scenario_runner
+source /opt/ros/humble/setup.bash
+source ~/ros2_ws/install/setup.bash
+```
 
 ## Launch the scenario
 
 Run the launch file to start the orchestrated mission:
 ```bash
 ros2 launch scenario_pkg scenario.launch.py
+```
+View camera topics:
+```bash
+ros2 run rqt_image_view rqt_image_view
 ```
 
 This brings up `scenario_runner`, which automatically:
@@ -69,11 +89,33 @@ This brings up `scenario_runner`, which automatically:
   ```bash
   ros2 service call /get_status std_srvs/srv/Trigger {}
   ```
-- Stall watchdog (new): the runner now monitors `/odom` to detect when motion commands are being published but the robot is not actually moving, and will advance LINE→GREEN or GREEN→HRI after the timeout (default 3s). Tweak via parameters:
+- Override a stall manually (force stage): jump to a specific stage or the next one if things get stuck.
+  ```bash
+  ros2 service call /set_stage interfaces/srv/SetString "{data: 'GREEN'}"  # or LINE/HRI/NEXT
+  ```
+- Stall watchdog: the runner monitors `/odom` to detect when motion commands are being published but the robot is not actually moving, and will advance LINE→GREEN or GREEN→HRI after the timeout (default 3s). It now waits for live `/odom` data before acting. Tweak via parameters:
   ```bash
   ros2 run scenario_pkg scenario_runner --ros-args -p motion_timeout:=3.0 -p motion_check_period:=0.5
   ```
   Make sure `/odom` is available; otherwise reduce the timeout or disable if testing in a headless environment.
-- Thread safety (green_nav): service callbacks and image/lidar callbacks are now guarded by a re-entrant lock to avoid races on `is_running`, `stop`, and related flags. No behavior change expected, just safer concurrent handling.
+- Thread safety (green_nav): service callbacks and image/lidar callbacks are guarded by a re-entrant lock to avoid races on `is_running`, `stop`, and related flags.
+- Servo logging: servo commands in HRI/green_nav/line_following still execute immediately but their console logs are throttled to every 0.5s to keep output readable.
+- Transition safety: stage launches are serialized to avoid overlapping transitions when manual overrides and watchdogs fire together.
 
 The scenario is hands-free once launched; no manual color picking or stage toggling is required.
+
+## Audio prompts
+
+Copy audio prompts into the scenario manager feedback_voice directory:
+```bash
+cp /home/ubuntu/shared/warning.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/start_track_green.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/find_target.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+```
+
+Copy HRI gesture audio prompts into the same feedback_voice directory:
+```bash
+cp /home/ubuntu/shared/Danger.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+cp /home/ubuntu/shared/Survivor.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
+# add any other .wav cues you want HRI.py to play into the same folder
+```

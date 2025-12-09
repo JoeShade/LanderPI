@@ -10,6 +10,7 @@ how camera processing, lidar checks, and wheel commands fit together.
 import os
 import cv2
 import math
+import time
 import rclpy
 import queue
 import threading
@@ -188,6 +189,8 @@ class LineFollowingNode(Node):
         self.lidar_type = os.environ.get('LIDAR_TYPE')
         self.machine_type = os.environ.get('MACHINE_TYPE')
         self.missing_profile_logged = False
+        self._servo_log_cooldown = 0.50  # seconds between logging servo commands
+        self._last_servo_log = 0.0
         # Camera topic and frame counters for debugging visibility.
         self.camera_topic = '/ascamera/camera_publisher/rgb0/image'
         self.image_qos = QoSProfile(depth=5, reliability=QoSReliabilityPolicy.BEST_EFFORT)
@@ -291,7 +294,7 @@ class LineFollowingNode(Node):
             if self.lidar_sub is None:
                 qos = QoSProfile(depth=1, reliability=QoSReliabilityPolicy.BEST_EFFORT)
                 self.lidar_sub = self.create_subscription(LaserScan, '/scan_raw', self.lidar_callback, qos)  # (subscribe to Lidar data)
-                set_servo_position(self.joints_pub, 1, ((10, 200), (5, 500), (4, 90), (3, 150), (2, 645), (1, 500))) # Use this to edit the arm position, parameters start from the gripper and end at the arm base
+                self._set_servo_position(((10, 200), (5, 500), (4, 90), (3, 150), (2, 645), (1, 500)), 1, "line_follow_pose") # Use this to edit the arm position, parameters start from the gripper and end at the arm base
             self.mecanum_pub.publish(Twist())
         response.success = True
         response.message = "enter"
@@ -362,9 +365,18 @@ class LineFollowingNode(Node):
         self.get_logger().info('\033[1;32m%s\033[0m' % "set threshold")
         with self.lock:
             self.threshold = request.data
-            response.success = True
-            response.message = "set_threshold"
-            return response
+        response.success = True
+        response.message = "set_threshold"
+        return response
+
+    def _set_servo_position(self, positions, duration=1.0, label=None):
+        """Send a servo command and log it at most every 500 ms to reduce spam."""
+        now = time.time()
+        if (now - self._last_servo_log) >= self._servo_log_cooldown:
+            tag = f" {label}" if label else ""
+            self.get_logger().info(f"[servo]{tag}: {positions}")
+            self._last_servo_log = now
+        set_servo_position(self.joints_pub, duration, positions)
 
     def set_color_srv_callback(self, request, response):
         self.get_logger().info('\033[1;32m%s\033[0m' % 'set_color')
