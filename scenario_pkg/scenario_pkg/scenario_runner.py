@@ -168,7 +168,11 @@ class ScenarioRunner(Node):
     """ROS 2 node that launches and supervises the full-featured stage nodes."""
 
     def __init__(self):
-        rclpy.init()
+        # ``rclpy`` must be initialized exactly once per process. Launch files or
+        # other entrypoints could have already called ``rclpy.init()``, so guard
+        # the call to avoid a runtime crash from double-initialization.
+        if not rclpy.ok():
+            rclpy.init()
         super().__init__("scenario_runner")
 
         # Debug toggles can be adjusted via ROS parameters or the command line
@@ -196,6 +200,7 @@ class ScenarioRunner(Node):
         self.current_process: Optional[subprocess.Popen] = None
         self.line_lost_frames = 0
         self.line_transition_armed = True  # start counting immediately to catch missing lines
+        # Two counters: raw frames received and frames we actually inspect.
         self.raw_frame_counter = 0  # counts every incoming image
         self.frame_counter = 0  # counts processed images
         self.process_every_n = max(1, int(self.declare_parameter("runner_process_every_n", 5).value))
@@ -260,9 +265,25 @@ class ScenarioRunner(Node):
         stdout_pipe = subprocess.PIPE if self.debug_mode else None
         stderr_pipe = subprocess.PIPE if self.debug_mode else None
         # Use unbuffered output so logs stream to ros2 log.
-        self.current_process = subprocess.Popen(
-            [sys.executable, "-u", script], env=env, stdout=stdout_pipe, stderr=stderr_pipe, text=True, bufsize=1
-        )
+        try:
+            self.current_process = subprocess.Popen(
+                [sys.executable, "-u", script], env=env, stdout=stdout_pipe, stderr=stderr_pipe, text=True, bufsize=1
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f"Failed to launch stage {stage.name} (script: {script}): {exc}. Stopping runner to avoid orphaned state."
+            )
+            self.shutdown_requested = True
+            self.mission_complete = True
+            try:
+                self.cmd_vel_pub.publish(Twist())
+            except Exception:
+                pass
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
+            return
         self.stage = stage
         self.line_lost_frames = 0
         self.frame_counter = 0
@@ -302,6 +323,7 @@ class ScenarioRunner(Node):
         except Exception:
             pass
         self._join_child_loggers()
+        self.current_process = None
 
     def _call_service(self, srv_type, name: str, request):
         """Utility to synchronously call a service with retry."""

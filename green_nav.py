@@ -8,6 +8,16 @@ import os
 import tempfile
 import threading
 import time
+
+
+def _get_camera_type(default: str = "aurora") -> str:
+    """Fetch DEPTH_CAMERA_TYPE with a sane default so missing envs don't crash."""
+
+    camera_type = os.environ.get("DEPTH_CAMERA_TYPE") or os.environ.get("CAMERA_TYPE")
+    if not camera_type:
+        camera_type = default
+        os.environ["DEPTH_CAMERA_TYPE"] = camera_type
+    return camera_type
 import cv2
 import numpy as np
 import rclpy
@@ -69,7 +79,8 @@ class LineFollower:
     def __call__(self, image, result_image, threshold, color):
         """Locate the largest green patch and report how far it sits from image center."""
         h, w = image.shape[:2]
-        if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
+        self.camera_type = _get_camera_type()
+        if self.camera_type == 'ascamera':
             w = w + 200
         lowerb = tuple(color['min'])
         upperb = tuple(color['max'])
@@ -184,7 +195,7 @@ class GreenLineFollowingNode(Node):
         self.window_enabled = False
         self.window_lock_handle = None
         self.lab_data = common.get_yaml_data("/home/ubuntu/software/lab_tool/lab_config.yaml")
-        self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.camera_type = _get_camera_type()
         lab_map = self.lab_data.get('lab', {})
         self.lab_lookup_type = self.camera_type if self.camera_type in lab_map else 'ascamera'
         self.last_image_ts = None
@@ -388,7 +399,7 @@ class GreenLineFollowingNode(Node):
     def enter_srv_callback(self, request, response):
         """Start green navigation: reset PID, subscribe topics, and begin searching."""
         self.get_logger().info('\033[1;32m%s\033[0m' % "green_nav enter")
-        if os.environ['DEPTH_CAMERA_TYPE'] != 'ascamera':
+        if self.camera_type != 'ascamera':
             self.pwm_controller([1850, 1500])
         with self.lock:
             self.stop = False

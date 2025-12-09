@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
 # encoding: utf-8
+"""Follow a colored line while avoiding obstacles with lidar.
+
+The node keeps the explanation light and conversational so newcomers can see
+how camera processing, lidar checks, and wheel commands fit together.
+"""
+
 # line following
 import os
 import cv2
@@ -27,6 +33,16 @@ from servo_controller.bus_servo_control import set_servo_position
 MAX_SCAN_ANGLE = 240  # degree(the scanning angle of lidar. The covered part is always eliminated)
 
 
+def _get_camera_type(default: str = "aurora") -> str:
+    """Fetch DEPTH_CAMERA_TYPE with a sane default so missing envs don't crash."""
+
+    camera_type = os.environ.get("DEPTH_CAMERA_TYPE") or os.environ.get("CAMERA_TYPE")
+    if not camera_type:
+        camera_type = default
+        os.environ["DEPTH_CAMERA_TYPE"] = camera_type
+    return camera_type
+
+
 def _load_lab_config():
     """Resolve LAB config from env override or user home; return empty dict on failure."""
     candidates = []
@@ -42,10 +58,12 @@ def _load_lab_config():
                 break
     return {}
 class LineFollower:
+    """Lightweight helper that finds the colored strip in the camera image."""
+
     def __init__(self, color, node):
         self.node = node
         self.target_lab, self.target_rgb = color
-        self.depth_camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.depth_camera_type = _get_camera_type()
         if self.depth_camera_type == 'ascamera':
             self.rois = ((0.9, 0.95, 0, 1, 0.7), (0.8, 0.85, 0, 1, 0.2), (0.7, 0.75, 0, 1, 0.1))
         elif self.depth_camera_type == 'aurora': # This is the camera we are using
@@ -73,7 +91,7 @@ class LineFollower:
     def __call__(self, image, result_image, threshold, color=None, use_color_picker=True):
         centroid_sum = 0
         h, w = image.shape[:2]
-        if os.environ['DEPTH_CAMERA_TYPE'] == 'ascamera':
+        if self.depth_camera_type == 'ascamera':
             w = w + 200
         hit_count = 0
         if use_color_picker:
@@ -124,8 +142,11 @@ class LineFollower:
         return result_image, deflection_angle, hit_count
 
 class LineFollowingNode(Node):
+    """ROS node that handles the full game: vision, lidar, and drive commands."""
+
     def __init__(self, name):
-        rclpy.init()
+        if not rclpy.ok():
+            rclpy.init()
         super().__init__(name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
         
         self.name = name
@@ -153,7 +174,7 @@ class LineFollowingNode(Node):
         self.use_color_picker = True
         self.lab_data = _load_lab_config()
         self.image_queue = queue.Queue(2)
-        self.camera_type = os.environ['DEPTH_CAMERA_TYPE']
+        self.camera_type = _get_camera_type()
         # Select lab profile: prefer configured camera, else ascamera, else first available, else None.
         lab_map = self.lab_data.get('lab', {})
         if self.camera_type in lab_map:
@@ -252,7 +273,7 @@ class LineFollowingNode(Node):
 
     def enter_srv_callback(self, request, response):
         self.get_logger().info('\033[1;32m%s\033[0m' % "line following enter")
-        if os.environ['DEPTH_CAMERA_TYPE'] != 'ascamera':
+        if self.camera_type != 'ascamera':
             self.pwm_controller([1850,1500]) ## Pan / tilt originally [1850, 1500]
         with self.lock:
             self.stop = False
