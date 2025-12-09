@@ -40,6 +40,7 @@ GREEN_COLOR_KEY = "green"  # LAB name in the calibration YAML for the target bea
 DEFAULT_BLACK_LAB = {"min": [0, 0, 0], "max": [40, 120, 120]}  # tuned for dark lines
 LINE_SEARCH_LOST_FRAMES = 10  # frames without a contour before we give up on the line
 BEACON_FOUND_AREA_RATIO = 0.06  # fraction of the image the green beacon should fill
+NEAR_TARGET_AREA_RATIO = 0.08  # fraction of image to trigger near-target slowing
 MAX_SCAN_ANGLE = 240  # degree span to honor from the lidar
 LINE_FORWARD_SPEED = 0.12  # m/s base forward speed while following the line
 GREEN_FORWARD_SPEED = 0.10  # m/s base forward speed while chasing the beacon
@@ -47,6 +48,9 @@ ANGULAR_CLAMP = 1.2  # limit angular velocity to keep spins sane
 LIDAR_STOP_DISTANCE = 0.25  # meters before we perform an immediate stop
 LIDAR_AVOID_DISTANCE = 0.45  # meters when we start biasing away from obstacles
 LIDAR_BIAS_GAIN = 0.8  # scale for converting lidar difference into angular velocity
+AVOIDANCE_STREAK = 2  # consecutive detections before avoidance locks in
+RETREAT_DISTANCE = 0.20  # meters to back away when we emergency stop
+NEAR_TARGET_TURN_SCALE = 0.5  # reduce angular speed when close to the beacon
 VOICE_COOLDOWN = 8.0  # seconds between voice prompts in HRI stage
 VOICE_VOLUME = 90  # playback volume used across stages
 
@@ -220,6 +224,14 @@ class ScenarioNode(Node):
         self.last_beacon_area = 0.0
         self.last_voice_ts = 0.0
         self.heartbeats = 0
+        self.beacon_lost_frames = 0
+        self.announced_search = False
+        self.announced_acquired = False
+        self.announced_avoidance = False
+        self.obstacle_close_streak = 0
+        self.emergency_retreat_until = None
+        self.avoidance_locked = False
+        self.avoidance_bias = 0.0
 
         threading.Thread(target=self._heartbeat, daemon=True).start()
         self.get_logger().info("Scenario orchestrator started. Beginning with line following.")
@@ -304,7 +316,11 @@ class ScenarioNode(Node):
         _, deflection, area_ratio = self.green_detector(image, lowerb, upperb)
         self.last_beacon_area = area_ratio
 
-        avoidance_bias = self._compute_avoidance_bias()
+        near_target = area_ratio >= NEAR_TARGET_AREA_RATIO
+        avoidance_bias, emergency_handled = self._compute_avoidance_bias(near_target=near_target)
+        if emergency_handled:
+            return
+
         if area_ratio >= BEACON_FOUND_AREA_RATIO:
             self.get_logger().info("Green beacon reached; entering HRI mode.")
             self._play_voice("success")
@@ -313,14 +329,27 @@ class ScenarioNode(Node):
             return
 
         if deflection is None:
-            # Lost beacon; slow spin to reacquire
-            angular = 0.25 + avoidance_bias
-            self._publish_twist(0.0, max(min(angular, ANGULAR_CLAMP), -ANGULAR_CLAMP))
+            self.beacon_lost_frames += 1
+            if not self.announced_search and self.beacon_lost_frames > 3:
+                self._play_voice("find_target")
+                self.announced_search = True
+            angular = 0.25 * (NEAR_TARGET_TURN_SCALE if near_target else 1.0) + avoidance_bias
+            angular = max(min(angular, ANGULAR_CLAMP), -ANGULAR_CLAMP)
+            forward = 0.0 if near_target else GREEN_FORWARD_SPEED * 0.2
+            self._publish_twist(forward, angular)
             return
 
+        if not self.announced_acquired:
+            self._play_voice("warning")
+            self.announced_acquired = True
+            self.announced_search = False
+
+        self.beacon_lost_frames = 0
         angular = float(self.beacon_pid.update(deflection)) + avoidance_bias
+        angular *= NEAR_TARGET_TURN_SCALE if near_target else 1.0
         angular = max(min(angular, ANGULAR_CLAMP), -ANGULAR_CLAMP)
-        self._publish_twist(GREEN_FORWARD_SPEED, angular)
+        forward = GREEN_FORWARD_SPEED * (0.5 if near_target else 1.0)
+        self._publish_twist(forward, angular)
 
     def _handle_hri(self, image: np.ndarray):
         gesture = self.gesture_classifier.classify(image)
@@ -346,21 +375,51 @@ class ScenarioNode(Node):
     # ------------------
     # Helpers
     # ------------------
-    def _compute_avoidance_bias(self) -> float:
+    def _compute_avoidance_bias(self, near_target: bool = False) -> Tuple[float, bool]:
         if self.lidar_ranges is None:
-            return 0.0
+            return 0.0, False
+
         left = np.mean(self.lidar_ranges[: len(self.lidar_ranges) // 3])
         right = np.mean(self.lidar_ranges[-len(self.lidar_ranges) // 3 :])
         front = np.min(self.lidar_ranges[len(self.lidar_ranges) // 3 : -len(self.lidar_ranges) // 3])
+        now = time.time()
+
         if front < LIDAR_STOP_DISTANCE:
-            self.get_logger().warn("Obstacle too close; stopping.")
-            self._publish_twist(0.0, 0.0)
-            return 0.0
-        bias = 0.0
-        if front < LIDAR_AVOID_DISTANCE:
-            bias = (right - left) * LIDAR_BIAS_GAIN
-            self.get_logger().debug(f"Avoidance bias applied: {bias:.2f}")
-        return max(min(bias, ANGULAR_CLAMP), -ANGULAR_CLAMP)
+            self.obstacle_close_streak += 1
+            if self.obstacle_close_streak >= AVOIDANCE_STREAK and self.emergency_retreat_until is None:
+                retreat_time = RETREAT_DISTANCE / max(GREEN_FORWARD_SPEED, 0.05)
+                self.emergency_retreat_until = now + retreat_time
+                self.get_logger().warn("Emergency retreat triggered by close obstacle.")
+                self._play_voice("warning")
+        else:
+            self.obstacle_close_streak = 0
+
+        if self.emergency_retreat_until is not None:
+            if now < self.emergency_retreat_until:
+                self._publish_twist(-GREEN_FORWARD_SPEED, 0.0)
+                return 0.0, True
+            self.emergency_retreat_until = None
+
+        activate_avoidance = front < LIDAR_AVOID_DISTANCE
+        if activate_avoidance:
+            self.obstacle_close_streak += 1
+        else:
+            self.obstacle_close_streak = 0
+
+        if activate_avoidance and (self.obstacle_close_streak >= AVOIDANCE_STREAK or self.avoidance_locked):
+            self.avoidance_locked = True
+            if not self.announced_avoidance:
+                self._play_voice("warning")
+                self.announced_avoidance = True
+            raw_bias = (right - left) * LIDAR_BIAS_GAIN
+            self.avoidance_bias = 0.7 * self.avoidance_bias + 0.3 * raw_bias
+        else:
+            self.avoidance_locked = False
+            self.announced_avoidance = False
+            self.avoidance_bias *= 0.5
+
+        bias = self.avoidance_bias * (NEAR_TARGET_TURN_SCALE if near_target else 1.0)
+        return max(min(bias, ANGULAR_CLAMP), -ANGULAR_CLAMP), False
 
     def _publish_twist(self, linear_x: float, angular_z: float):
         twist = Twist()
@@ -416,6 +475,11 @@ class ScenarioNode(Node):
         self.stage = MissionStage.GREEN_NAV
         self._set_head_pose("look_up")
         self._publish_twist(0.0, 0.0)
+        self.beacon_lost_frames = 0
+        self.announced_search = False
+        self.announced_acquired = False
+        self.announced_avoidance = False
+        self.avoidance_locked = False
 
     def _heartbeat(self):
         while rclpy.ok():
