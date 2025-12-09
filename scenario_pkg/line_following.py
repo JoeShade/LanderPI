@@ -71,12 +71,7 @@ class LineFollower:
 
     @staticmethod
     def get_area_max_contour(contours, threshold=100):
-        '''
-        获取最大面积对应的轮廓(get the contour of the largest area)
-        :param contours:
-        :param threshold:
-        :return:
-        '''
+        """Return the largest contour above the given area threshold."""
         contour_area = zip(contours, tuple(map(lambda c: math.fabs(cv2.contourArea(c)), contours)))
         contour_area = tuple(filter(lambda c_a: c_a[1] > threshold, contour_area))
         if len(contour_area) > 0:
@@ -554,6 +549,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
