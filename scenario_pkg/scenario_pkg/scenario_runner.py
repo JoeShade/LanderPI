@@ -34,8 +34,9 @@ from servo_controller_msgs.msg import ServosPosition
 # ------------------
 # Global constants
 # ------------------
-LINE_COLOR_KEY = "blue"  # LAB name in the calibration YAML for the painted line
+LINE_COLOR_KEY = "black"  # LAB name in the calibration YAML for the painted line
 GREEN_COLOR_KEY = "green"  # LAB name in the calibration YAML for the target beacon
+DEFAULT_BLACK_LAB = {"min": [0, 0, 0], "max": [40, 120, 120]}  # tuned for dark lines
 LINE_SEARCH_LOST_FRAMES = 10  # frames without a contour before we give up on the line
 BEACON_FOUND_AREA_RATIO = 0.06  # fraction of the image the green beacon should fill
 MAX_SCAN_ANGLE = 240  # degree span to honor from the lidar
@@ -202,7 +203,9 @@ class ScenarioNode(Node):
         lab = lab_data.get("lab", {})
         camera_type = os.environ.get("DEPTH_CAMERA_TYPE", "ascamera")
         lookup_type = camera_type if camera_type in lab else "ascamera"
-        self.line_color = lab.get(lookup_type, {}).get(LINE_COLOR_KEY, {"min": [0, 0, 0], "max": [255, 255, 255]})
+        self.line_color = lab.get(lookup_type, {}).get(LINE_COLOR_KEY, DEFAULT_BLACK_LAB)
+        if self.line_color == DEFAULT_BLACK_LAB:
+            self.get_logger().info("Using built-in black line profile; no picking required.")
         self.green_color = lab.get(lookup_type, {}).get(GREEN_COLOR_KEY, {"min": [0, 0, 0], "max": [255, 255, 255]})
 
         # State bookkeeping
