@@ -38,6 +38,16 @@ source /opt/ros/humble/setup.bash
 source ~/ros2_ws/install/setup.bash
 ```
 
+- Create Launcher stub:
+```bash
+mkdir -p ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg
+cat > ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg/scenario_runner <<'EOF'
+#!/usr/bin/env bash
+exec /usr/bin/env python3 -m scenario_pkg.scenario_runner "$@"
+EOF
+chmod +x ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg/scenario_runner
+```
+
 - Launch the orchestrated mission (line following -> green nav -> HRI):
 ```bash
 ros2 launch scenario_pkg scenario.launch.py

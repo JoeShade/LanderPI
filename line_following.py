@@ -237,7 +237,7 @@ class LineFollowingNode(Node):
     def enter_srv_callback(self, request, response):
         self.get_logger().info('\033[1;32m%s\033[0m' % "line following enter")
         if self.camera_type != 'ascamera':
-            self.pwm_controller([1850,1500]) ## Pan / tilt originally [1850, 1500]
+a            self.pwm_controller([1850,1500]) ## Pan / tilt originally [1850, 1500]
         with self.lock:
             self.stop = False
             self.is_running = False
