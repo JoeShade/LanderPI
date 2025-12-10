@@ -1,30 +1,46 @@
 # Useful commands
 
-## Green Nav
+## Line following program
+- Launch with debug enabled:
+```bash
+ros2 launch app line_following_node.launch.py debug:=true
+```
+- Enter the line-following routine:
+```bash
+ros2 service call /line_following/enter std_srvs/srv/Trigger {}
+```
+- Allow the node to drive:
+```bash
+ros2 service call /line_following/set_running std_srvs/srv/SetBool "{data: True}"
+```
+
+## Green nav program
 - Launch required topics:
 ```bash
 ros2 launch green_nav_pkg green_nav_with_sensors.launch.py
 ```
-
 - Launch `green_nav` with debug features:
 ```bash
 ros2 run green_nav_pkg green_nav --ros-args -p debug:=true
 ```
-
 - Start the program:
 ```bash
 ros2 service call /green_nav/enter std_srvs/srv/Trigger {}
 ```
-
 - Rebuild the package:
 ```bash
 cd ~/ros2_ws
 colcon build --packages-select green_nav_pkg --symlink-install
 ```
-
 - Replace the program file with a new build:
 ```bash
 cp /home/ubuntu/shared/green_nav.py ~/ros2_ws/src/green_nav_pkg/green_nav_pkg/
+```
+
+## HRI program
+- Launch the gesture-based controller:
+```bash
+ros2 launch HRI_pkg HRI_control.launch.py
 ```
 
 ## Scenario manager (scenario_pkg)
@@ -47,17 +63,14 @@ exec /usr/bin/env python3 -m scenario_pkg.scenario_runner "$@"
 EOF
 chmod +x ~/ros2_ws/install/scenario_pkg/lib/scenario_pkg/scenario_runner
 ```
-
 - Launch the orchestrated mission (line following -> green nav -> HRI):
 ```bash
 ros2 launch scenario_pkg scenario.launch.py
 ```
-
 - Run the node directly (e.g., in a dev shell):
 ```bash
 ros2 run scenario_pkg scenario_runner
 ```
-
 - Copy audio prompts into the scenario manager feedback_voice directory:
 ```bash
 cp /home/ubuntu/shared/warning.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
@@ -66,7 +79,6 @@ cp /home/ubuntu/shared/find_target.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/f
 cp /home/ubuntu/shared/Danger.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
 cp /home/ubuntu/shared/Survivor.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feedback_voice/
 ```
-
 - Useful run-time knobs:
 ```bash
 # Adjust camera tuning used for transitions (default DEPTH_CAMERA_TYPE=aurora)
