@@ -1,4 +1,4 @@
-# Scenario Package
+﻿# Scenario Package
 
 This ROS 2 Python package orchestrates the full `line_following.py`, `green_nav.py`, and `HRI.py` scripts so they run back-to-back without user input. The runner keeps the original nodes intact by launching the source scripts as subprocesses, handing off from line following, to green beacon navigation, and finally to gesture-based HRI.
 
@@ -114,7 +114,7 @@ cp /home/ubuntu/shared/Survivor.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feed
   ```bash
   ros2 service call /set_stage interfaces/srv/SetString "{data: 'GREEN'}"  # or LINE/HRI/NEXT
   ```
-- Stall watchdog: the runner monitors `/odom` to detect when motion commands are being published but the robot is not actually moving, and will advance LINE→GREEN or GREEN→HRI after the timeout (default 3s). It now waits for live `/odom` data before acting. Tweak via parameters:
+- Stall watchdog: the runner monitors `/odom` to detect when motion commands are being published but the robot is not actually moving, and will advance LINEη'GREEN or GREENη'HRI after the timeout (default 3s). It now waits for live `/odom` data before acting. Tweak via parameters:
   ```bash
   ros2 run scenario_pkg scenario_runner --ros-args -p motion_timeout:=3.0 -p motion_check_period:=0.5
   ```
@@ -124,4 +124,3 @@ cp /home/ubuntu/shared/Survivor.wav ~/ros2_ws/src/scenario_pkg/scenario_pkg/feed
 - Transition safety: stage launches are serialized to avoid overlapping transitions when manual overrides and watchdogs fire together.
 
 The scenario is hands-free once launched; no manual color picking or stage toggling is required.
-
